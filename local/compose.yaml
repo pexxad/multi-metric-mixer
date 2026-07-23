@@ -1,0 +1,43 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.0
+    command: ["start-dev", "--import-realm", "--hostname", "http://127.0.0.1:8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: local-admin-password
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/multi-metric-mixer-realm.json:ro
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: metrics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local-postgres-admin
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d metrics"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mongodb:
+    image: mongo:8.0
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: local-mongo-admin
+      MONGO_INITDB_DATABASE: metrics
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - ./mongodb/init.js:/docker-entrypoint-initdb.d/10-init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--username", "root", "--password", "local-mongo-admin", "--authenticationDatabase", "admin", "--eval", "db.adminCommand('ping').ok"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
