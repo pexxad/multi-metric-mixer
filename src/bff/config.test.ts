@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { loadRuntimeConfig } from './config'
+import { testCapabilityKeys } from '../test-support'
 
+const keys = testCapabilityKeys()
 const base = {
   AUTH_PROVIDER_KEY: 'oidc-main',
   SESSION_SECRET: 'session-secret-that-is-at-least-32-characters',
@@ -8,6 +10,7 @@ const base = {
   OIDC_ISSUER: 'https://id.example.com',
   OIDC_CLIENT_ID: 'multi-metric-mixer',
   OIDC_REDIRECT_URI: 'https://app.example.com/auth/callback',
+  BACKEND_TOKEN_PRIVATE_KEY_BASE64: keys.privateKeyBase64,
 }
 
 describe('runtime config', () => {
@@ -15,14 +18,14 @@ describe('runtime config', () => {
     expect(() => loadRuntimeConfig({})).toThrow('AUTH_PROVIDER_KEY is required')
   })
 
-  it('separates public and MCP listeners and fixes MCP to IPv4 loopback', () => {
+  it('separates public and Backend listeners and fixes Backend to IPv4 loopback', () => {
     const config = loadRuntimeConfig(base)
     expect(config.publicServer.port).toBe(3000)
-    expect(config.mcpServer).toMatchObject({ hostname: '127.0.0.1', port: 3001, grantTtlSeconds: 30 })
+    expect(config.backendServer).toMatchObject({ hostname: '127.0.0.1', port: 3001, tokenTtlSeconds: 15 })
   })
 
   it('rejects a shared public and MCP port', () => {
-    expect(() => loadRuntimeConfig({ ...base, PORT: '3000', MCP_PORT: '3000' })).toThrow('must be different')
+    expect(() => loadRuntimeConfig({ ...base, PORT: '3000', BACKEND_PORT: '3000' })).toThrow('must be different')
   })
 
   it('rejects origin values that are not exact origins', () => {
@@ -31,7 +34,7 @@ describe('runtime config', () => {
   })
 
   it('fails closed when PostgreSQL secret configuration is missing', () => {
-    expect(() => loadRuntimeConfig({ ...base, STORAGE_DRIVER: 'postgres' })).toThrow()
+    expect(() => loadRuntimeConfig({ ...base, BFF_STORAGE_DRIVER: 'postgres' })).toThrow()
   })
 
   it('allows insecure OIDC transport only through an explicit loopback provider policy', () => {

@@ -3,13 +3,21 @@ import { createPublicApp } from './app'
 import { runtimeConfigSchema, type RuntimeConfig } from './config'
 import { createBffServices, type BffServices } from './runtime'
 import { sampleWorkflow } from '../shared/workflow'
-import { AppError } from '../server/errors'
+import { AppError } from '../shared/errors'
+import { testCapabilityKeys } from '../test-support'
+import { backendRuntimeConfigSchema, type BackendRuntimeConfig } from '../backend-server/config'
+import { createBackendCore, type BackendCore } from '../backend-core/runtime'
+import { createBackendApp } from '../backend-server/app'
 
+const capabilityKeys = testCapabilityKeys()
 const config: RuntimeConfig = runtimeConfigSchema.parse({
   version: 1,
   release: 'test',
   publicServer: { hostname: '127.0.0.1', port: 3000, origin: 'http://localhost:3000', allowedOrigins: ['http://localhost:3000'] },
-  mcpServer: { hostname: '127.0.0.1', port: 3001, origin: 'http://127.0.0.1:3000', grantTtlSeconds: 30 },
+  backendServer: {
+    hostname: '127.0.0.1', port: 3001, origin: 'http://127.0.0.1:3000', audience: 'http://127.0.0.1:3001',
+    tokenIssuer: 'test-bff', tokenKeyId: 'test-1', tokenPrivateKeyBase64: capabilityKeys.privateKeyBase64, tokenTtlSeconds: 15,
+  },
   auth: {
     providerKey: 'oidc-main', sessionTtlSeconds: 3600,
     sessionSecret: 'session-secret-that-is-at-least-32-characters',
@@ -18,20 +26,37 @@ const config: RuntimeConfig = runtimeConfigSchema.parse({
       scopes: ['openid'], groupsClaim: 'groups', adminGroup: 'multi-metric-mixer-admins',
       providerLabel: 'Organization sign-in', logout: { mode: 'oidc' }, allowInsecureLoopback: false },
   },
-  storage: { driver: 'sqlite', sqlitePath: ':memory:', artifactPath: '/tmp/multi-metric-mixer-bff-tests' },
+  bffStorage: { driver: 'sqlite', sqlitePath: ':memory:' },
   limits: { apiBodyBytes: 262_144, uploadBytes: 1_048_576, sourceResponseBytes: 2_097_152, sourceRows: 5_000, jsonDepth: 32, concurrentRunsPerWorkspace: 2 },
+})
+const backendConfig: BackendRuntimeConfig = backendRuntimeConfigSchema.parse({
+  release: 'test', publicOrigin: 'http://localhost:3000',
+  backendServer: {
+    hostname: '127.0.0.1', port: 3001, origin: 'http://127.0.0.1:3000', audience: 'http://127.0.0.1:3001',
+    tokenIssuer: 'test-bff', tokenKeyId: 'test-1', tokenPublicKeyBase64: capabilityKeys.publicKeyBase64,
+  },
+  backendStorage: { driver: 'sqlite', sqlitePath: ':memory:', artifactPath: '/tmp/multi-metric-mixer-backend-tests' },
+  limits: config.limits,
   sourceNetwork: { allowedPrivateHosts: [], allowedHttpHosts: [] },
+  sourceSecrets: { provider: 'file', filePath: '/tmp/multi-metric-mixer-test-source-secrets.json' },
 })
 
 describe('public Hono BFF', () => {
   let services: BffServices
+  let backend: BackendCore
   let app: ReturnType<typeof createPublicApp>
 
   beforeEach(async () => {
-    services = await createBffServices(config)
+    backend = await createBackendCore(backendConfig)
+    const backendApp = createBackendApp(backendConfig, backend)
+    const backendFetch: typeof fetch = async (input, init) => backendApp.request(input instanceof URL ? input.toString() : input, init)
+    services = await createBffServices(config, { backendFetch })
     app = createPublicApp({ config, services })
   })
-  afterEach(async () => services.close())
+  afterEach(async () => {
+    await services.close()
+    await backend.close()
+  })
 
   async function login(subject: string, applicationRole: 'admin' | 'user' = 'user') {
     const identity = await services.identities.resolve({
@@ -84,7 +109,7 @@ describe('public Hono BFF', () => {
     const bootstrap = await (await app.request('/api/bootstrap', { headers })).json()
     expect(bootstrap).toMatchObject({
       workflows: [{ workflow: { name: 'Second' }, version: 2 }],
-      mcp: { tools: 14, dataSourceAccess: 'read-only' },
+      mcp: { tools: 25, dataSourceAccess: 'read-only' },
     })
   })
 
@@ -100,7 +125,7 @@ describe('public Hono BFF', () => {
     expect(await archived.json()).toEqual({ archived: true })
     expect(await (await app.request('/api/workflows', { headers })).json()).toEqual({ workflows: [] })
     expect((await app.request(`/api/workflows/${sampleWorkflow.id}`, { headers })).status).toBe(404)
-    expect(await services.database.query.selectFrom('workflow_versions').selectAll().where('workflow_id', '=', sampleWorkflow.id).execute()).toHaveLength(1)
+    expect(await backend.database.query.selectFrom('workflow_versions').selectAll().where('workflow_id', '=', sampleWorkflow.id).execute()).toHaveLength(1)
   })
 
   it('allows only administrators to manage data sources while all Workspace members can select them', async () => {
@@ -158,7 +183,10 @@ describe('public Hono BFF', () => {
     const observation = { sourceId: 'sales', observedAt: '2026-07-22T00:00:00.000Z', rowCount: 1, sampledRows: 1,
       schemaFingerprint: 'schema-1', fields: [{ path: 'amount', dataTypes: ['number'], nullable: false, presence: 1,
         businessName: '', description: '', unit: '', timezone: '' }] }
-    vi.spyOn(services.mcp, 'call').mockResolvedValue({ observation })
+    vi.spyOn(services.mcp, 'call').mockImplementation(async (context) => ({
+      observation,
+      catalog: await backend.catalogs.applyObservation(context, 'sales', observation),
+    }))
     const respond = vi.spyOn(services.agent, 'respond')
       .mockResolvedValueOnce({ state: 'exploration', message: '項目を確認します。', changes: [], sourceIds: ['sales'], reason: 'Catalogが未登録です。' })
       .mockResolvedValueOnce({ state: 'clarification', message: '金額の期間を確認します。', changes: [],
@@ -167,7 +195,7 @@ describe('public Hono BFF', () => {
       body: JSON.stringify({ clientMessageId: 'explore-1', message: '売上を集計したい', workflow: sampleWorkflow }) })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ state: 'clarification' })
-    expect(services.mcp.call).toHaveBeenCalledWith(expect.anything(), 'data_source_profile',
+    expect(services.mcp.call).toHaveBeenCalledWith(expect.anything(), 'catalog_explore_personal',
       { source: 'sales', parameters: { limit: '100' } })
     expect(respond).toHaveBeenCalledTimes(2)
     expect(respond.mock.calls[1]?.[0].catalogs).toMatchObject([{ sourceId: 'sales', scope: 'personal',
@@ -250,13 +278,13 @@ describe('public Hono BFF', () => {
     await app.request('/api/data-sources', { method: 'POST', headers: { ...alice.headers, 'Content-Type': 'application/json' }, body: JSON.stringify(registration) })
     expect((await app.request('/api/data-sources/sample-api', { method: 'DELETE', headers: alice.headers })).status).toBe(200)
     expect(await (await app.request('/api/data-sources', { headers: alice.headers })).json()).toEqual({ sources: [] })
-    const stored = await services.database.query.selectFrom('data_sources').select(['status', 'version']).where('id', '=', 'sample-api').executeTakeFirst()
+    const stored = await backend.database.query.selectFrom('data_sources').select(['status', 'version']).where('id', '=', 'sample-api').executeTakeFirst()
     expect(stored).toMatchObject({ status: 'archived', version: 2 })
   })
 
   it('requires a checksum-bound one-time approval for Artifact download and exposes no direct GET link', async () => {
     const alice = await login('alice', 'admin')
-    const artifact = await services.artifacts.createCsv({ ...alice.identity, sessionHash: 'fixture', requestId: 'artifact-create' },
+    const artifact = await backend.artifacts.createCsv({ ...alice.identity, sessionHash: 'fixture', requestId: 'artifact-create' },
       'report.csv', [{ value: '=1+1' }], ['test'], 'spreadsheet')
     expect((await app.request(`/artifacts/${artifact.id}/download`, { headers: alice.headers })).status).toBe(404)
     const approvalResponse = await app.request(`/api/artifacts/${artifact.id}/download-approvals`, { method: 'POST',

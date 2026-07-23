@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto'
-import { AppError } from '../server/errors'
-import type { RequestContext } from '../server/request-context'
-import type { McpExecutionGrantStore } from '../server/mcp/execution-grant'
-import { contentHash } from '../server/persistence/workflow-repository'
+import { AppError } from '../shared/errors'
+import type { RequestContext } from '../shared/request-context'
+import type { BackendCapabilityIssuer } from '../shared/backend-capability'
+import { contentHash } from '../shared/canonical-hash'
 
 type InternalMcpClientOptions = {
   url: URL
   origin: string
-  grants: McpExecutionGrantStore
+  capabilities: BackendCapabilityIssuer
   fetch?: typeof fetch
 }
 
@@ -35,13 +35,19 @@ export class InternalMcpClient {
   async call<T>(context: RequestContext, tool: string, input: Record<string, unknown>, workflowContentHash?: string, approvalId?: string): Promise<T> {
     const invocationContext = { ...context, requestId: `${context.requestId}.${randomUUID()}` }
     const body = { jsonrpc: '2.0', id: invocationContext.requestId, method: 'tools/call', params: { name: tool, arguments: input } }
-    const grant = await this.options.grants.issue(invocationContext, { action: tool, inputHash: contentHash(body), workflowContentHash, approvalId })
+    const capability = this.options.capabilities.issue(invocationContext, {
+      action: tool,
+      inputHash: contentHash(body),
+      scopes: ['backend:mcp', `tool:${tool}`],
+      workflowContentHash,
+      approvalId,
+    })
     const response = await this.fetcher(this.options.url, {
       method: 'POST',
       headers: {
         Host: this.options.url.host,
         Origin: this.options.origin,
-        Authorization: `Bearer ${grant}`,
+        Authorization: `Bearer ${capability}`,
         Accept: 'application/json, text/event-stream',
         'Content-Type': 'application/json',
         ...(workflowContentHash ? { 'X-Workflow-Content-Hash': workflowContentHash } : {}),

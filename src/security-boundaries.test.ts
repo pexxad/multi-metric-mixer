@@ -1,15 +1,15 @@
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
-import { createMcpRequestHandler } from './mcp-server/server'
-import { loadMcpRuntimeConfig } from './server/config'
-import { testDatabase } from './test-support'
-import { IdentityRepository } from './server/persistence/identity-repository'
-import { SessionService } from './server/auth/session-service'
+import { createMcpRequestHandler } from './backend-server/mcp-adapter'
+import { loadBackendRuntimeConfig } from './backend-server/config'
+import { testBffDatabase } from './test-support'
+import { IdentityRepository } from './bff/persistence/identity-repository'
+import { SessionService } from './bff/auth/session-service'
 
 describe('Version 1 security boundaries', () => {
-  it.each(['GET', 'POST', 'DELETE'])('rejects missing or unexpected MCP Origin for %s before grant handling', async (method) => {
+  it.each(['GET', 'POST', 'DELETE'])('rejects missing or unexpected MCP Origin for %s before capability handling', async (method) => {
     const handler = createMcpRequestHandler({ expectedHost: '127.0.0.1:3001', expectedOrigin: 'http://127.0.0.1:3000',
-      grants: {} as never, invocations: {} as never, dependencies: {} as never })
+      verifier: {} as never, invocations: {} as never, dependencies: {} as never })
     expect((await handler(new Request('http://127.0.0.1:3001/mcp', { method,
       headers: { Host: '127.0.0.1:3001' }, ...(method === 'POST' ? { body: '{}' } : {}) }))).status).toBe(403)
     expect((await handler(new Request('http://127.0.0.1:3001/mcp', { method,
@@ -17,9 +17,9 @@ describe('Version 1 security boundaries', () => {
   })
 
   it('contains no external data-source write command or identity fields in MCP tool input', async () => {
-    const source = await readFile('src/mcp-server/server.ts', 'utf8')
-    const aws = await readFile('src/mcp-server/connectors/aws.ts', 'utf8')
-    const databases = await readFile('src/mcp-server/connectors/databases.ts', 'utf8')
+    const source = await readFile('src/backend-server/mcp-adapter.ts', 'utf8')
+    const aws = await readFile('src/backend-core/connectors/aws.ts', 'utf8')
+    const databases = await readFile('src/backend-core/connectors/databases.ts', 'utf8')
     for (const forbidden of ['PutCommand', 'UpdateCommand', 'DeleteCommand', 'TransactWrite', 'PutLogEvents']) {
       expect(aws).not.toContain(forbidden)
     }
@@ -31,8 +31,8 @@ describe('Version 1 security boundaries', () => {
   })
 
   it('fails closed for incomplete production storage and rotates BFF sessions', async () => {
-    expect(() => loadMcpRuntimeConfig({ STORAGE_DRIVER: 'postgres', DATABASE_URL_SECRET_ID: 'db' })).toThrow()
-    const database = await testDatabase()
+    expect(() => loadBackendRuntimeConfig({ BACKEND_STORAGE_DRIVER: 'postgres', BACKEND_DATABASE_URL_SECRET_ID: 'db' })).toThrow()
+    const database = await testBffDatabase()
     try {
       const identity = await new IdentityRepository(database).resolve({ providerKey: 'oidc', subject: 'alice',
         displayName: 'Alice', groups: [], applicationRole: 'user', assuranceLevel: 'basic' })

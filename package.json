@@ -6,7 +6,7 @@
   "scripts": {
     "local": "node --env-file=local/app.env scripts/local.mjs",
     "local:down": "docker compose -f local/compose.yaml down",
-    "dev": "concurrently --kill-others-on-fail -n bff,mcp,web -c cyan,yellow,magenta \"node --env-file-if-exists=.env --import tsx --watch src/bff/index.ts\" \"node --env-file-if-exists=.env --import tsx --watch src/mcp-server/index.ts\" \"vite\"",
+    "dev": "node --env-file-if-exists=.env scripts/dev.mjs",
     "build": "tsc --noEmit && vite build && node scripts/build.mjs",
     "test": "vitest run",
     "check": "tsc --noEmit && npm test",
@@ -43,7 +43,6 @@
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.3",
-    "concurrently": "^9.2.4",
     "esbuild": "^0.28.1",
     "jsdom": "^29.1.1",
     "tsx": "4.23.1",

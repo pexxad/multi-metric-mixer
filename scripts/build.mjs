@@ -15,5 +15,5 @@ const common = {
 }
 await Promise.all([
   build({ ...common, entryPoints: ['src/bff/index.ts'], outfile: 'dist/server/bff.mjs' }),
-  build({ ...common, entryPoints: ['src/mcp-server/index.ts'], outfile: 'dist/server/mcp.mjs' }),
+  build({ ...common, entryPoints: ['src/backend-server/index.ts'], outfile: 'dist/server/backend.mjs' }),
 ])

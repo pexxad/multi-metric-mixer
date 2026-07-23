@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import ipaddr from 'ipaddr.js'
-import { exactOrigin, limitsSchema, loadMcpRuntimeConfig, mcpServerSchema, portSchema, sourceNetworkSchema, storageSchema } from '../server/config'
+import { resolve } from 'node:path'
+import { databaseStorageSchema, exactOrigin, limitsSchema, portSchema } from '../shared/runtime-config'
 
 const providerKeySchema = z.string().min(1).max(64).regex(/^[a-z][a-z0-9_-]*$/)
 const secretSchema = z.string().min(32)
@@ -29,7 +30,16 @@ function commaSeparatedOrigins(value: string): string[] {
 export const runtimeConfigSchema = z.object({
   version: z.literal(1), release: z.string().min(1),
   publicServer: z.object({ hostname: z.string().min(1), port: portSchema, origin: z.url(), allowedOrigins: z.array(z.url()).min(1) }),
-  mcpServer: mcpServerSchema,
+  backendServer: z.object({
+    hostname: z.literal('127.0.0.1'),
+    port: portSchema,
+    origin: z.url(),
+    audience: z.url(),
+    tokenIssuer: z.string().min(1),
+    tokenKeyId: z.string().min(1),
+    tokenPrivateKeyBase64: z.string().min(32),
+    tokenTtlSeconds: z.number().int().min(5).max(60),
+  }),
   auth: z.object({
     providerKey: providerKeySchema, sessionTtlSeconds: z.number().int().min(300).max(24 * 60 * 60),
     sessionSecret: secretSchema, transactionSecret: secretSchema,
@@ -38,7 +48,7 @@ export const runtimeConfigSchema = z.object({
       providerLabel: z.string().min(1).max(100), logout: oidcLogoutSchema, allowInsecureLoopback: z.boolean() }),
   }),
   agent: agentProviderSchema.default({ provider: 'disabled' }),
-  storage: storageSchema, limits: limitsSchema, sourceNetwork: sourceNetworkSchema,
+  bffStorage: databaseStorageSchema, limits: limitsSchema,
 })
 export type RuntimeConfig = z.infer<typeof runtimeConfigSchema>
 
@@ -52,9 +62,9 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     throw new Error('OIDC_LOGOUT_USE_ID_TOKEN_HINT must be either true or false.')
   }
   if (logoutMode === 'cognito' && !env.OIDC_LOGOUT_ENDPOINT) throw new Error('OIDC_LOGOUT_ENDPOINT is required when OIDC_LOGOUT_MODE=cognito.')
-  const common = loadMcpRuntimeConfig(env)
   const publicPort = portSchema.parse(env.PORT ?? 3000)
-  if (publicPort === common.mcpServer.port) throw new Error('PORT and MCP_PORT must be different listeners.')
+  const backendPort = portSchema.parse(env.BACKEND_PORT ?? 3001)
+  if (publicPort === backendPort) throw new Error('PORT and BACKEND_PORT must be different listeners.')
   const publicOrigin = exactOrigin(env.PUBLIC_ORIGIN ?? `http://localhost:${publicPort}`, 'PUBLIC_ORIGIN')
   const agentProvider = env.AGENT_PROVIDER ?? 'disabled'
   if (agentProvider !== 'disabled' && agentProvider !== 'openai-compatible') {
@@ -87,10 +97,19 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       transportSecurity: baseUrl.protocol === 'https:' ? 'https' : isLoopbackHttp ? 'loopback-http' : 'private-http' }
   }
   return runtimeConfigSchema.parse({
-    version: 1, release: common.release,
+    version: 1, release: env.APP_RELEASE ?? 'development',
     publicServer: { hostname: env.HOST ?? '127.0.0.1', port: publicPort, origin: publicOrigin,
       allowedOrigins: commaSeparatedOrigins(env.ALLOWED_ORIGINS ?? publicOrigin) },
-    mcpServer: common.mcpServer,
+    backendServer: {
+      hostname: '127.0.0.1',
+      port: backendPort,
+      origin: exactOrigin(env.BACKEND_CALLER_ORIGIN ?? `http://127.0.0.1:${publicPort}`, 'BACKEND_CALLER_ORIGIN'),
+      audience: exactOrigin(env.BACKEND_AUDIENCE ?? `http://127.0.0.1:${backendPort}`, 'BACKEND_AUDIENCE'),
+      tokenIssuer: env.BACKEND_TOKEN_ISSUER ?? 'multi-metric-mixer-bff',
+      tokenKeyId: env.BACKEND_TOKEN_KEY_ID ?? 'bff-1',
+      tokenPrivateKeyBase64: env.BACKEND_TOKEN_PRIVATE_KEY_BASE64 ?? '',
+      tokenTtlSeconds: Number(env.BACKEND_TOKEN_TTL_SECONDS ?? 15),
+    },
     auth: { providerKey: env.AUTH_PROVIDER_KEY, sessionTtlSeconds: Number(env.SESSION_TTL_SECONDS ?? 8 * 60 * 60),
       sessionSecret: env.SESSION_SECRET, transactionSecret: env.AUTH_TRANSACTION_SECRET,
       oidc: { issuer: env.OIDC_ISSUER, clientId: env.OIDC_CLIENT_ID, clientSecret: env.OIDC_CLIENT_SECRET,
@@ -101,6 +120,19 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
           : { mode: 'oidc', useIdTokenHint: env.OIDC_LOGOUT_USE_ID_TOKEN_HINT !== 'false' },
         allowInsecureLoopback: env.OIDC_ALLOW_HTTP_LOOPBACK === 'true' } },
     agent,
-    storage: common.storage, limits: common.limits, sourceNetwork: common.sourceNetwork,
+    bffStorage: env.BFF_STORAGE_DRIVER === 'postgres'
+      ? { driver: 'postgres', databaseUrlSecretId: env.BFF_DATABASE_URL_SECRET_ID ?? '', awsRegion: env.AWS_REGION ?? '' }
+      : { driver: 'sqlite', sqlitePath: resolve(env.BFF_DATA_DIR ?? '.data', 'bff-v1.sqlite') },
+    limits: {
+      apiBodyBytes: Number(env.API_BODY_BYTES ?? 256 * 1024),
+      uploadBytes: Number(env.UPLOAD_BYTES ?? 10 * 1024 * 1024),
+      sourceResponseBytes: Number(env.SOURCE_RESPONSE_BYTES ?? 2 * 1024 * 1024),
+      sourceRows: Number(env.SOURCE_ROWS ?? 5_000),
+      jsonDepth: Number(env.JSON_DEPTH ?? 32),
+      concurrentRunsPerWorkspace: Number(env.CONCURRENT_RUNS_PER_WORKSPACE ?? 2),
+      joinRows: Number(env.JOIN_ROWS ?? 100_000),
+      artifactStorageBytes: Number(env.ARTIFACT_STORAGE_BYTES ?? 1024 * 1024 * 1024),
+      artifactRetentionDays: Number(env.ARTIFACT_RETENTION_DAYS ?? 30),
+    },
   })
 }

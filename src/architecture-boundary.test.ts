@@ -24,22 +24,28 @@ function dependencyClosure(entries: string[]): Set<string> {
   return visited
 }
 
-describe('BFF and MCP process dependency boundary', () => {
+describe('BFF and Backend process dependency boundary', () => {
   it('keeps BFF free of MCP server, connector, aggregation, and MCP SDK implementation imports', () => {
     const files = [...dependencyClosure(['bff/index.ts'])]
-    expect(files.some((file) => file.includes('/mcp-server/'))).toBe(false)
+    expect(files.some((file) => file.includes('/backend-core/') || file.includes('/backend-server/'))).toBe(false)
     const source = files.map((file) => readFileSync(file, 'utf8')).join('\n')
     expect(source).not.toContain('@modelcontextprotocol/sdk')
     expect(source).not.toContain('DynamoDBClient')
     expect(source).not.toContain('CloudWatchLogsClient')
   })
 
-  it('keeps MCP process free of BFF, Browser UI, OIDC provider, and password/session-cookie handling', () => {
-    const files = [...dependencyClosure(['mcp-server/index.ts'])]
+  it('keeps Backend process free of BFF, Browser UI, OIDC provider, and password/session-cookie handling', () => {
+    const files = [...dependencyClosure(['backend-server/index.ts'])]
     expect(files.some((file) => file.includes('/bff/') || file.includes('/client/'))).toBe(false)
     const source = files.map((file) => readFileSync(file, 'utf8')).join('\n')
     expect(source).not.toContain('openid-client')
     expect(source).not.toContain('setCookie(')
     expect(source).not.toContain('OIDC_CLIENT_SECRET')
+  })
+
+  it('keeps the MCP adapter dependency graph free of the API-only connection administration service', () => {
+    const files = [...dependencyClosure(['backend-server/mcp-adapter.ts'])]
+    expect(files.some((file) => file.endsWith('/backend-server/data-source-admin-service.ts'))).toBe(false)
+    expect(files.some((file) => file.endsWith('/backend-server/api-adapter.ts'))).toBe(false)
   })
 })

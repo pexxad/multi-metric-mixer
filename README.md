@@ -11,7 +11,7 @@ npm ci
 npm run local
 ```
 
-`npm run local`は、ローカル用のKeycloak、PostgreSQL、MongoDBをDockerで起動し、続けてUI、BFF、MCP serverを開発モードで起動します。
+`npm run local`は、ローカル用のKeycloak、PostgreSQL、MongoDBをDockerで起動し、続けてUI、BFF、Backend serverを開発モードで起動します。
 
 UIはOIDC callbackとBFFのOrigin制約に合わせて`5173`固定です。すでに別processが`5173`を使用している場合は`5174`へ自動変更せず、どのportが競合したかを表示して停止します。古い開発processを終了してから再実行してください。
 
@@ -119,23 +119,25 @@ OIDC Providerには`http://localhost:5173/auth/callback`をcallback URL、`http:
 
 | コマンド | 用途 |
 | --- | --- |
-| `npm run local` | Keycloak・DB・UI・BFF・MCPをまとめてローカル起動 |
+| `npm run local` | Keycloak・DB・UI・BFF・Backendをまとめてローカル起動 |
 | `npm run local:down` | ローカルのDockerサービスを停止 |
-| `npm run dev` | `.env`を使ってUI・BFF・MCPをwatch起動 |
+| `npm run dev` | `.env`を使ってUI・BFF・Backendをwatch起動 |
 | `npm test` | 全テストを実行 |
 | `npm run check` | TypeScript検査と全テストを実行 |
-| `npm run build` | UI、BFF、MCPのproduction artifactを生成 |
-| `npm run verify` | `check`、`build`、成果物境界検査、BFF／MCP別process smokeを実行 |
+| `npm run build` | UI、BFF、Backendのproduction artifactを生成 |
+| `npm run verify` | `check`、`build`、成果物境界検査、BFF／Backend別process smokeを実行 |
 
 起動するprocessは常に次の3つです。
 
 | Process | 開発時URL | 役割 |
 | --- | --- | --- |
 | Vite UI | `http://localhost:5173` | ブラウザUI |
-| Hono BFF | `http://localhost:3000` | 認証、管理API、内部MCP client |
-| MCP server | `http://127.0.0.1:3001/mcp` | BFFだけが利用するloopback listener |
+| Hono BFF | `http://localhost:3000` | OIDC/session、Browser API、Agent/LLM、Conversation、Backend client |
+| Backend server | `http://127.0.0.1:3001` | MCP/API Adapter、Backend Core。BFFだけが利用するloopback listener |
 
-BFFの稼働確認は`/health`、MCPを含む準備完了確認は`/ready`です。
+BFFの稼働確認は`/health`、Backend到達性を含む準備完了確認は`/ready`です。Backendは`/mcp`と`/internal/api`を同じloopback listenerで提供します。Data source接続の登録・変更・test・archiveはInternal APIだけにあり、MCP toolとして公開されません。
+
+localの永続化も共有DBではありません。BFFのidentity/session/Conversationは`.data/bff-v1.sqlite`、BackendのData source/Catalog/Workflow/Run/Artifact metadataは`.data/backend-v1.sqlite`へ保存されます。BFFはBackend DBを直接参照せず、起動時に生成されるEd25519署名付き短期CapabilityでBackendを呼び出します。productionでは同じkeyを固定管理し、BFFへprivate key、Backendへpublic keyだけを配置します。
 
 ## ローカルのデータソースを試す
 
@@ -215,11 +217,11 @@ Base URLは`http://127.0.0.1:3100`、Pathは`/patterns/mixed`、Methodは`GET`�
 
 ## Production
 
-ProductionではBFFとMCPを別processとして起動するため、単一の`npm start`は設けていません。`npm run build`で生成した次のentrypointを、systemdなどのprocess managerから個別に起動します。
+ProductionではBFFとBackendを別processとして起動するため、単一の`npm start`は設けていません。`npm run build`で生成した次のentrypointを、systemdなどのprocess managerから個別に起動します。
 
 ```text
 node dist/server/bff.mjs
-node dist/server/mcp.mjs
+node dist/server/backend.mjs
 ```
 
 現在の対応構成と設定方法は[EC2 production profile](deploy/ec2/README.md)を参照してください。リリース前は`npm run verify`を実行します。
@@ -229,7 +231,7 @@ node dist/server/mcp.mjs
 | 内容 | ドキュメント |
 | --- | --- |
 | ユーザー体験と機能要件 | [Product design](docs/product-design.md) |
-| BFF・MCP・認証・データ境界 | [Architecture](docs/architecture.md) |
+| BFF・Backend・MCP/API Adapter・認証・データ境界 | [Architecture](docs/architecture.md) |
 | 永続化スキーマ | [Database schema](docs/database-schema.md) |
 | Version 1.0の実装対応 | [Acceptance matrix](docs/version-1-acceptance.md) |
 | AWSでの確認項目 | [Release verification](docs/version-1-release-verification.md) |
