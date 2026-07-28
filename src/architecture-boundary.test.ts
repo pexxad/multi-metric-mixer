@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, extname, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
@@ -17,7 +17,8 @@ function dependencyClosure(entries: string[]): Set<string> {
       const specifier = match[1]!
       if (!specifier.startsWith('.')) continue
       const base = resolve(dirname(file), specifier)
-      const target = extname(base) ? base : `${base}.ts`
+      const target = extname(base) ? base : [`${base}.ts`, `${base}.tsx`].find(existsSync)
+      if (!target) throw new Error(`Import target not found: ${specifier} from ${file}`)
       pending.push(target)
     }
   }
@@ -25,6 +26,11 @@ function dependencyClosure(entries: string[]): Set<string> {
 }
 
 describe('BFF and Backend process dependency boundary', () => {
+  it('keeps Browser code free of BFF and Backend implementations', () => {
+    const files = [...dependencyClosure(['client/main.tsx'])]
+    expect(files.some((file) => file.includes('/bff/') || file.includes('/backend-core/') || file.includes('/backend-server/'))).toBe(false)
+  })
+
   it('keeps BFF free of MCP server, connector, aggregation, and MCP SDK implementation imports', () => {
     const files = [...dependencyClosure(['bff/index.ts'])]
     expect(files.some((file) => file.includes('/backend-core/') || file.includes('/backend-server/'))).toBe(false)
@@ -47,5 +53,11 @@ describe('BFF and Backend process dependency boundary', () => {
     const files = [...dependencyClosure(['backend-server/mcp-adapter.ts'])]
     expect(files.some((file) => file.endsWith('/backend-server/data-source-admin-service.ts'))).toBe(false)
     expect(files.some((file) => file.endsWith('/backend-server/api-adapter.ts'))).toBe(false)
+    expect(files.some((file) => file.endsWith('/backend-server/connection-profile-registry.ts'))).toBe(false)
+  })
+
+  it('keeps Backend Core independent from Backend server configuration and adapters', () => {
+    const files = [...dependencyClosure(['backend-core/runtime.ts'])]
+    expect(files.some((file) => file.includes('/backend-server/'))).toBe(false)
   })
 })

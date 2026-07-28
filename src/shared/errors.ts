@@ -1,3 +1,5 @@
+import { ZodError } from 'zod'
+
 export type ProblemDetails = {
   type: string
   title: string
@@ -31,6 +33,27 @@ export function toProblemDetails(error: unknown, requestId?: string): ProblemDet
       detail: error.expose ? error.message : undefined,
       requestId,
       errors: error.expose ? error.details : undefined,
+    }
+  }
+  if (error instanceof ZodError) {
+    return {
+      type: 'https://multi-metric-mixer.example/problems/invalid_request',
+      title: 'リクエストの形式が正しくありません。',
+      status: 400,
+      code: 'invalid_request',
+      detail: '入力内容を確認してください。',
+      requestId,
+      errors: error.issues,
+    }
+  }
+  if (error instanceof SyntaxError) {
+    return {
+      type: 'https://multi-metric-mixer.example/problems/invalid_json',
+      title: 'JSONの形式が正しくありません。',
+      status: 400,
+      code: 'invalid_json',
+      detail: 'JSONの構文を確認してください。',
+      requestId,
     }
   }
   return {

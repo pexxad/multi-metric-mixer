@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { AppError } from '../../shared/errors'
 import type { RequestContext } from '../../shared/request-context'
-import type { ArtifactSummary, TableRow } from '../../shared/workflow'
+import type { ArtifactSummary, JsonValue, TableRow } from '../../shared/workflow'
 import type { BackendDatabase } from '../../backend-core/persistence/backend-database'
 import type { ArtifactContentStore } from './artifact-content-store'
 import type { StoredArtifact } from '../../shared/backend-contract'
@@ -61,6 +61,33 @@ export class ArtifactRepository {
     }, metadata.expiresAt)
   }
 
+  createDocuments(
+    context: RequestContext,
+    name: string,
+    documents: JsonValue[],
+    provenance: string[],
+    metadata: ArtifactMetadata = {},
+  ): Promise<StoredArtifact> {
+    const serialized = JSON.stringify(documents)
+    return this.insert(context, {
+      id: `art_${randomUUID()}`,
+      workspaceId: context.workspace.id,
+      runId: metadata.runId,
+      type: 'documents',
+      name,
+      rowCount: documents.length,
+      columns: [],
+      preview: documents.slice(0, 10),
+      provenance,
+      trustLevel: 'untrusted',
+      classification: metadata.classification ?? 'internal',
+      checksum: sha256(serialized),
+      createdAt: new Date().toISOString(),
+      documents,
+      content: Buffer.from(serialized),
+    }, metadata.expiresAt)
+  }
+
   async createCsv(
     context: RequestContext,
     name: string,
@@ -108,7 +135,10 @@ export class ArtifactRepository {
     if (!row) return undefined
     const content = await this.contentStore.get(row.object_key as string)
     const type = row.type as StoredArtifact['type']
-    const rows = type === 'table' && content ? JSON.parse(Buffer.from(content).toString('utf8')) as TableRow[] : undefined
+    const parsed = (type === 'table' || type === 'documents') && content
+      ? JSON.parse(Buffer.from(content).toString('utf8')) as JsonValue[] : undefined
+    const rows = type === 'table' ? parsed as TableRow[] | undefined : undefined
+    const documents = type === 'documents' ? parsed : undefined
     return {
       id: row.id as string,
       workspaceId: row.workspace_id as string,
@@ -124,6 +154,7 @@ export class ArtifactRepository {
       checksum: row.checksum as string,
       createdAt: row.created_at as string,
       rows,
+      documents,
       content: type === 'csv' ? content : undefined,
       mimeType: row.media_type as string | undefined,
     }
@@ -131,12 +162,25 @@ export class ArtifactRepository {
 
   async requireTable(context: RequestContext, id: string): Promise<StoredArtifact & { rows: TableRow[] }> {
     const artifact = await this.get(context, id)
-    if (!artifact?.rows) throw new AppError('artifact_not_found', 404, `テーブル成果物「${id}」が見つかりません。`)
+    if (!artifact) throw new AppError('artifact_not_found', 404, `成果物「${id}」が見つかりません。`)
+    if (artifact.type !== 'table' || !artifact.rows) {
+      throw new AppError('artifact_type_mismatch', 400, `成果物「${id}」は表形式ではありません。先に「表形式に変換」ノードを接続してください。`)
+    }
     return artifact as StoredArtifact & { rows: TableRow[] }
   }
 
+  async requireDocuments(context: RequestContext, id: string): Promise<StoredArtifact & { documents: JsonValue[] }> {
+    const artifact = await this.get(context, id)
+    if (!artifact) throw new AppError('artifact_not_found', 404, `成果物「${id}」が見つかりません。`)
+    if (artifact.type !== 'documents' || !artifact.documents) {
+      throw new AppError('artifact_type_mismatch', 400, `成果物「${id}」はJSONライク形式ではありません。`)
+    }
+    return artifact as StoredArtifact & { documents: JsonValue[] }
+  }
+
   summary(artifact: StoredArtifact): ArtifactSummary {
-    const { workspaceId: _workspaceId, runId: _runId, rows: _rows, content: _content, mimeType: _mimeType, ...summary } = artifact
+    const { workspaceId: _workspaceId, runId: _runId, rows: _rows, documents: _documents,
+      content: _content, mimeType: _mimeType, ...summary } = artifact
     return summary
   }
 

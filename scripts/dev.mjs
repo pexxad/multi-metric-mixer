@@ -23,9 +23,7 @@ const bffEnvironment = {
     'BACKEND_DATABASE_URL_SECRET_ID',
     'BACKEND_STORAGE_DRIVER',
     'BACKEND_DATA_DIR',
-    'DATA_SOURCE_SECRET_PROVIDER',
-    'DATA_SOURCE_SECRET_PREFIX',
-    'DATA_SOURCE_SECRET_FILE',
+    'DATA_CONNECTION_PROFILES_FILE',
   ], ['ARTIFACT_', 'SOURCE_ALLOWED_']),
   BACKEND_TOKEN_PRIVATE_KEY_BASE64: privateKey,
 }
@@ -50,7 +48,7 @@ const browserEnvironment = without(process.env, [
   'SESSION_SECRET',
   'AUTH_TRANSACTION_SECRET',
   'OPENAI_COMPATIBLE_API_KEY',
-], ['AUTH_', 'OIDC_', 'AGENT_', 'OPENAI_COMPATIBLE_', 'DATA_SOURCE_SECRET_', 'ARTIFACT_'])
+], ['AUTH_', 'OIDC_', 'AGENT_', 'OPENAI_COMPATIBLE_', 'DATA_CONNECTION_', 'ARTIFACT_'])
 
 const children = [
   spawn(process.execPath, ['--import', 'tsx', '--watch', 'src/bff/index.ts'], { env: bffEnvironment, stdio: 'inherit' }),

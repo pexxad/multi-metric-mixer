@@ -40,12 +40,18 @@ export class UploadIngestionService {
       } else if (text.includes('\0')) {
         throw new AppError('upload_signature_invalid', 415, 'CSVとして扱えないbinary dataです。')
       }
-      const rows = await parseUploadInWorker(text, input.format, this.limits)
-      if (performance.now() - started > this.limits.maxParseMs + 500) throw new AppError('upload_parse_timeout', 408, 'ファイル解析時間が上限を超えました。')
-      return await this.artifacts.createTable(context, name, rows, [
+      const provenance = [
         `upload:${input.format}`, `upload:filename=${name}`, `upload:bytes=${input.bytes.byteLength}`,
         `upload:sha256=${createHash('sha256').update(input.bytes).digest('hex')}`, 'quarantine:validated', 'trust:untrusted',
-      ])
+      ]
+      if (input.format === 'json') {
+        const documents = await parseUploadInWorker(text, 'json', this.limits)
+        if (performance.now() - started > this.limits.maxParseMs + 500) throw new AppError('upload_parse_timeout', 408, 'ファイル解析時間が上限を超えました。')
+        return await this.artifacts.createDocuments(context, name, documents, provenance)
+      }
+      const rows = await parseUploadInWorker(text, 'csv', this.limits)
+      if (performance.now() - started > this.limits.maxParseMs + 500) throw new AppError('upload_parse_timeout', 408, 'ファイル解析時間が上限を超えました。')
+      return await this.artifacts.createTable(context, name, rows, provenance)
     } finally {
       await this.contentStore.delete(quarantineKey).catch(() => undefined)
     }

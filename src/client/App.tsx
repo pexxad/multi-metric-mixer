@@ -2,20 +2,12 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, us
 import {
   Background,
   BackgroundVariant,
-  ControlButton,
-  Controls,
-  Handle,
   MiniMap,
-  MarkerType,
-  Position,
   ReactFlow,
   applyNodeChanges,
-  useReactFlow,
   type Connection,
   type Edge,
-  type Node,
   type NodeChange,
-  type NodeProps,
 } from '@xyflow/react'
 import {
   Braces,
@@ -23,7 +15,6 @@ import {
   Calculator,
   Check,
   ChevronRight,
-  CircleAlert,
   Database,
   FileDown,
   GitMerge,
@@ -40,13 +31,9 @@ import {
   Sigma,
   ArrowDownWideNarrow,
   Table2,
-  Trash2,
   Undo2,
   Workflow as WorkflowIcon,
   X,
-  ZoomIn,
-  ZoomOut,
-  Maximize2,
 } from 'lucide-react'
 import {
   deleteWorkflowSteps,
@@ -75,286 +62,41 @@ import {
   type SavedWorkflow,
   type WorkflowListItem,
 } from './api'
-import type { CatalogField, CatalogVersion } from '../shared/catalog'
+import type { CatalogVersion } from '../shared/catalog'
 import { LoginView } from './LoginView'
 import { ConnectionManager } from './ConnectionManager'
-import type { AgentProviderStatus, AgentResponse } from '../shared/api'
+import type { AgentResponse, AgentToolActivity } from '../shared/api'
 import { WorkflowTransferActions } from './WorkflowTransferActions'
 import { OperationsPanel } from './OperationsPanel'
 import { ArtifactDownloadButton } from './ArtifactDownloadButton'
 import { WorkflowManager } from './WorkflowManager'
 import { ApprovalSummary } from './ApprovalSummary'
 import { ChatWorkspace, type ChatViewMessage } from './ChatWorkspace'
+import { NodeInspector } from './NodeInspector'
+import {
+  connectNodes,
+  createWorkflowStepId,
+  disconnectEdge,
+  duplicateWorkflowStep,
+  fieldsForStep,
+  instantiateWorkflowTemplate,
+  outputDataModel,
+  requiredInputDataModel,
+  sourceIdsForStep,
+  workflowHistoryReducer,
+  workflowsEqual,
+} from './workflow-editor'
+import {
+  LabeledFlowControls,
+  workflowNodeMeta,
+  workflowNodeTypes,
+  workflowToEdges,
+  workflowToNodes,
+  type FlowNode,
+  type WorkflowNodeData,
+} from './workflow-graph'
 
 const CatalogManager = lazy(() => import('./CatalogManager').then((module) => ({ default: module.CatalogManager })))
-
-type WorkflowNodeData = {
-  label: string
-  subtitle: string
-  kind: WorkflowStep['kind']
-  status?: 'completed'
-  invalid?: boolean
-  missingInput?: boolean
-  missingLeft?: boolean
-  missingRight?: boolean
-}
-
-type FlowNode = Node<WorkflowNodeData>
-
-function sourceIdsForStep(workflow: Workflow, stepId: string | null, visited = new Set<string>()): string[] {
-  if (!stepId || visited.has(stepId)) return []
-  visited.add(stepId)
-  const step = workflow.steps.find((item) => item.id === stepId)
-  if (!step) return []
-  if (step.kind === 'query') return step.config.source === 'unconfigured' ? [] : [step.config.source]
-  if ('input' in step) return sourceIdsForStep(workflow, step.input, visited)
-  return [...new Set([
-    ...sourceIdsForStep(workflow, step.inputs.left, new Set(visited)),
-    ...sourceIdsForStep(workflow, step.inputs.right, new Set(visited)),
-  ])]
-}
-
-function fieldsForStep(workflow: Workflow, catalogs: CatalogVersion[], stepId: string | null, visited = new Set<string>()): CatalogField[] {
-  if (!stepId || visited.has(stepId)) return []
-  visited.add(stepId)
-  const step = workflow.steps.find((item) => item.id === stepId)
-  if (!step) return []
-  if (step.kind === 'query') return catalogs.find((catalog) => catalog.sourceId === step.config.source)?.definition.fields ?? []
-  if ('inputs' in step) {
-    const left = fieldsForStep(workflow, catalogs, step.inputs.left, new Set(visited))
-    const right = fieldsForStep(workflow, catalogs, step.inputs.right, new Set(visited))
-    if (step.kind === 'joinAggregate') {
-      const group = right.find((field) => field.path === step.config.groupBy)
-      return [...(group ? [group] : []), derivedField(`${step.config.operation}_${step.config.metric}`, 'number')]
-    }
-    const output = new Map(left.map((field) => [field.path, field]))
-    for (const field of right) output.set(output.has(field.path) ? `right.${field.path}` : field.path,
-      output.has(field.path) ? { ...field, path: `right.${field.path}` } : field)
-    return [...output.values()]
-  }
-  const input = fieldsForStep(workflow, catalogs, step.input, visited)
-  if (step.kind === 'filterSelect') return step.config.columns.length
-    ? step.config.columns.flatMap((path) => input.find((field) => field.path === path) ?? []) : input
-  if (step.kind === 'derive') {
-    const type = step.config.operation === 'toString' ? 'string' : 'number'
-    return [...input.filter((field) => field.path !== step.config.output), derivedField(step.config.output, type)]
-  }
-  if (step.kind === 'aggregate') {
-    const group = input.find((field) => field.path === step.config.groupBy)
-    return [...(group ? [group] : []), derivedField(`${step.config.operation}_${step.config.metric}`, 'number')]
-  }
-  return input
-}
-
-function derivedField(path: string, type: CatalogField['dataTypes'][number]): CatalogField {
-  return { path, dataTypes: [type], nullable: false, presence: 1, businessName: '', description: '', unit: '', timezone: '' }
-}
-
-function CatalogFieldSelect({ label, value, fields, numeric, onChange, onOpenCatalog }: {
-  label: string; value: string; fields: CatalogField[]; numeric?: boolean; onChange(value: string): void; onOpenCatalog(): void
-}) {
-  const candidates = numeric ? fields.filter((field) => field.dataTypes.includes('number')) : fields
-  if (candidates.length === 0) return <label>{label}<input value={value} onChange={(event) => onChange(event.target.value)} />
-    <button type="button" className="catalog-inline-link" onClick={onOpenCatalog}>Catalogを確認・探索</button></label>
-  const known = candidates.some((field) => field.path === value)
-  return <label>{label}<select value={value} onChange={(event) => onChange(event.target.value)}>
-    {!known && <option value={value}>{value}（Catalog未登録）</option>}
-    {candidates.map((field) => <option key={field.path} value={field.path}>{field.businessName ? `${field.businessName} · ` : ''}{field.path} ({field.dataTypes.join('/')})</option>)}
-  </select></label>
-}
-
-function LabeledFlowControls() {
-  const { fitView, zoomIn, zoomOut } = useReactFlow()
-
-  return <Controls className="labeled-flow-controls" showZoom={false} showFitView={false} showInteractive={false}>
-    <ControlButton aria-label="拡大" onClick={() => void zoomIn()}><ZoomIn size={14} /><span>拡大</span></ControlButton>
-    <ControlButton aria-label="縮小" onClick={() => void zoomOut()}><ZoomOut size={14} /><span>縮小</span></ControlButton>
-    <ControlButton aria-label="全体表示" onClick={() => void fitView({ padding: 0.22 })}><Maximize2 size={14} /><span>全体表示</span></ControlButton>
-  </Controls>
-}
-
-const kindMeta = {
-  query: { eyebrow: 'DATA SOURCE', icon: Database, color: '#67a2d4' },
-  filterSelect: { eyebrow: 'TRANSFORM', icon: ListFilter, color: '#8aa979' },
-  derive: { eyebrow: 'TRANSFORM', icon: Calculator, color: '#a7986d' },
-  join: { eyebrow: 'MULTI-SOURCE', icon: GitMerge, color: '#a985ae' },
-  aggregate: { eyebrow: 'TRANSFORM', icon: Sigma, color: '#c19a62' },
-  joinAggregate: { eyebrow: 'MULTI-SOURCE', icon: GitMerge, color: '#b584a7' },
-  sortLimit: { eyebrow: 'TRANSFORM', icon: ArrowDownWideNarrow, color: '#799eaa' },
-  preview: { eyebrow: 'OUTPUT', icon: Table2, color: '#70a990' },
-  csv: { eyebrow: 'OUTPUT', icon: FileDown, color: '#8d88bd' },
-} as const
-
-function WorkflowNode({ data, selected }: NodeProps<FlowNode>) {
-  const meta = kindMeta[data.kind]
-  const Icon = meta.icon
-  return (
-    <div className={`flow-node ${selected ? 'selected' : ''} ${data.invalid ? 'invalid' : ''}`} style={{ '--node-accent': meta.color } as React.CSSProperties}>
-      {data.kind === 'joinAggregate' || data.kind === 'join'
-        ? <><Handle id="left" className={data.missingLeft ? 'missing-handle' : ''} type="target" position={Position.Left} style={{ top: '38%' }} /><Handle id="right" className={data.missingRight ? 'missing-handle' : ''} type="target" position={Position.Left} style={{ top: '72%' }} /></>
-        : data.kind !== 'query' && <Handle className={data.missingInput ? 'missing-handle' : ''} type="target" position={Position.Left} />}
-      <div className="node-topline">
-        <span className="node-icon"><Icon size={15} strokeWidth={2.2} /></span>
-        <span>{meta.eyebrow}</span>
-        {data.status === 'completed' && <span className="node-complete"><Check size={12} /></span>}
-        {data.invalid && <span className="node-invalid"><CircleAlert size={12} /> 要設定</span>}
-      </div>
-      <strong>{data.label}</strong>
-      <small>{data.subtitle}</small>
-      <Handle type="source" position={Position.Right} />
-    </div>
-  )
-}
-
-const nodeTypes = { workflow: WorkflowNode }
-
-function stepSubtitle(step: WorkflowStep): string {
-  if (step.kind === 'query') return step.config.source === 'unconfigured' ? '接続先を登録してください' : step.config.source
-  if (step.kind === 'filterSelect') return step.input ? `${step.config.filters.length}条件 / ${step.config.columns.length || '全'}列` : '入力が接続されていません'
-  if (step.kind === 'derive') return step.input ? `${step.config.output} ← ${step.config.operation}(${step.config.source})` : '入力が接続されていません'
-  if (step.kind === 'join') return step.inputs.left && step.inputs.right ? `${step.config.leftKey} = ${step.config.rightKey} / ${step.config.joinType}` : '左右の入力を接続してください'
-  if (step.kind === 'aggregate') return step.input ? `${step.config.groupBy} / ${step.config.operation}(${step.config.metric})` : '入力が接続されていません'
-  if (step.kind === 'joinAggregate') return step.inputs.left && step.inputs.right ? `${step.config.leftKey} = ${step.config.rightKey} → ${step.config.groupBy}` : '左右の入力を接続してください'
-  if (step.kind === 'sortLimit') return step.input ? `${step.config.sortBy} ${step.config.direction} / ${step.config.limit}件` : '入力が接続されていません'
-  if (step.kind === 'preview') return step.input ? `先頭 ${step.config.limit} 行` : '入力が接続されていません'
-  if (!step.input) return '入力が接続されていません'
-  return step.config.fileName
-}
-
-const positions: Record<WorkflowStep['kind'], { x: number; y: number }> = {
-  query: { x: 40, y: 150 },
-  filterSelect: { x: 280, y: 70 },
-  derive: { x: 350, y: 180 },
-  join: { x: 420, y: 300 },
-  aggregate: { x: 320, y: 150 },
-  joinAggregate: { x: 400, y: 320 },
-  sortLimit: { x: 520, y: 170 },
-  preview: { x: 600, y: 45 },
-  csv: { x: 600, y: 260 },
-}
-
-function stepNeedsConfiguration(step: WorkflowStep, workflow: Workflow, dataSources: DataSource[]): boolean {
-  const stepIndex = workflow.steps.findIndex((item) => item.id === step.id)
-  const stepIds = new Set(workflow.steps.slice(0, stepIndex).map((item) => item.id))
-  if (step.kind === 'query') return step.config.source === 'unconfigured' || !dataSources.some((source) => source.id === step.config.source)
-  if (step.kind === 'joinAggregate' || step.kind === 'join') return !step.inputs.left || !step.inputs.right || !stepIds.has(step.inputs.left) || !stepIds.has(step.inputs.right)
-    || step.inputs.left === step.inputs.right || Object.values(step.config).some((value) => typeof value === 'string' && !value.trim())
-  if (!step.input || !stepIds.has(step.input)) return true
-  if (step.kind === 'aggregate') return !step.config.groupBy.trim() || !step.config.metric.trim()
-  if (step.kind === 'derive') return !step.config.output.trim() || !step.config.source.trim()
-  if (step.kind === 'sortLimit') return !step.config.sortBy.trim()
-  if (step.kind === 'csv') return !step.config.fileName.trim()
-  return false
-}
-
-function workflowToNodes(workflow: Workflow, run?: WorkflowRun, dataSources: DataSource[] = []): FlowNode[] {
-  const countByKind = new Map<string, number>()
-  return workflow.steps.map((step) => {
-    const index = countByKind.get(step.kind) ?? 0
-    countByKind.set(step.kind, index + 1)
-    const base = positions[step.kind]
-    const priorIds = new Set(workflow.steps.slice(0, workflow.steps.findIndex((item) => item.id === step.id)).map((item) => item.id))
-    return {
-      id: step.id,
-      type: 'workflow',
-      position: { x: base.x + index * 32, y: base.y + index * 118 },
-      data: {
-        label: step.title,
-        subtitle: stepSubtitle(step),
-        kind: step.kind,
-        invalid: stepNeedsConfiguration(step, workflow, dataSources),
-        missingInput: 'input' in step && (!step.input || !priorIds.has(step.input)),
-        missingLeft: 'inputs' in step && (!step.inputs.left || !priorIds.has(step.inputs.left)),
-        missingRight: 'inputs' in step && (!step.inputs.right || !priorIds.has(step.inputs.right)),
-        status: run?.steps.some((item) => item.stepId === step.id && item.status === 'completed') ? 'completed' : undefined,
-      },
-    }
-  })
-}
-
-function workflowToEdges(workflow: Workflow): Edge[] {
-  const edges: Edge[] = []
-  for (const step of workflow.steps) {
-    if ('inputs' in step) {
-      if (step.inputs.left) edges.push({ id: `${step.inputs.left}-${step.id}-left`, source: step.inputs.left, target: step.id, targetHandle: 'left', markerEnd: { type: MarkerType.ArrowClosed, color: '#9aa7b7' }, style: { stroke: '#9aa7b7', strokeWidth: 1.6 } })
-      if (step.inputs.right) edges.push({ id: `${step.inputs.right}-${step.id}-right`, source: step.inputs.right, target: step.id, targetHandle: 'right', markerEnd: { type: MarkerType.ArrowClosed, color: '#9aa7b7' }, style: { stroke: '#9aa7b7', strokeWidth: 1.6 } })
-    } else if ('input' in step && step.input) {
-      edges.push({ id: `${step.input}-${step.id}`, source: step.input, target: step.id, markerEnd: { type: MarkerType.ArrowClosed, color: '#9aa7b7' }, style: { stroke: '#9aa7b7', strokeWidth: 1.6 } })
-    }
-  }
-  return edges
-}
-
-type WorkflowHistory = { past: Workflow[]; present: Workflow; future: Workflow[] }
-type WorkflowHistoryAction =
-  | { type: 'edit'; update: Workflow | ((current: Workflow) => Workflow) }
-  | { type: 'reset'; workflow: Workflow }
-  | { type: 'undo' }
-  | { type: 'redo' }
-
-export function workflowHistoryReducer(state: WorkflowHistory, action: WorkflowHistoryAction): WorkflowHistory {
-  if (action.type === 'reset') return { past: [], present: action.workflow, future: [] }
-  if (action.type === 'undo') {
-    const previous = state.past.at(-1)
-    return previous ? { past: state.past.slice(0, -1), present: previous, future: [state.present, ...state.future] } : state
-  }
-  if (action.type === 'redo') {
-    const next = state.future[0]
-    return next ? { past: [...state.past, state.present].slice(-50), present: next, future: state.future.slice(1) } : state
-  }
-  const next = typeof action.update === 'function' ? action.update(state.present) : action.update
-  if (next === state.present || JSON.stringify(next) === JSON.stringify(state.present)) return state
-  return { past: [...state.past, state.present].slice(-50), present: next, future: [] }
-}
-
-export function disconnectEdge(workflow: Workflow, edge: Edge): Workflow {
-  return {
-    ...workflow,
-    steps: workflow.steps.map((step) => {
-      if (step.id !== edge.target) return step
-      if ('inputs' in step) {
-        const side = edge.targetHandle === 'right' ? 'right' : 'left'
-        return step.inputs[side] === edge.source ? { ...step, inputs: { ...step.inputs, [side]: null } } : step
-      }
-      return 'input' in step && step.input === edge.source ? { ...step, input: null } : step
-    }),
-  }
-}
-
-export function connectNodes(workflow: Workflow, connection: Connection): Workflow {
-  if (!connection.source || !connection.target) return workflow
-  return {
-    ...workflow,
-    steps: workflow.steps.map((step) => {
-      if (step.id !== connection.target) return step
-      if ('inputs' in step) return { ...step, inputs: { ...step.inputs, [connection.targetHandle === 'right' ? 'right' : 'left']: connection.source! } }
-      return 'input' in step ? { ...step, input: connection.source! } : step
-    }),
-  }
-}
-
-export function duplicateWorkflowStep(workflow: Workflow, stepId: string, newId: string): Workflow {
-  const index = workflow.steps.findIndex((step) => step.id === stepId)
-  if (index < 0) return workflow
-  const original = workflow.steps[index]!
-  const duplicate = { ...structuredClone(original), id: newId, title: `${original.title} のコピー` } as WorkflowStep
-  return { ...workflow, steps: [...workflow.steps.slice(0, index + 1), duplicate, ...workflow.steps.slice(index + 1)] }
-}
-
-export function instantiateWorkflowTemplate(template: Workflow): Workflow {
-  return { ...structuredClone(template), id: `wf_${crypto.randomUUID().replaceAll('-', '')}` }
-}
-
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize)
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonicalize(item)]))
-  return value
-}
-
-export function workflowsEqual(left: Workflow, right: Workflow): boolean {
-  return JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right))
-}
 
 export function App() {
   const [auth, setAuth] = useState<AuthSession | null>()
@@ -375,7 +117,6 @@ export function App() {
   const [workflowLibrary, setWorkflowLibrary] = useState<WorkflowListItem[]>([])
   const [workflowVersions, setWorkflowVersions] = useState<SavedWorkflow[]>([])
   const [conversations, setConversations] = useState<Array<{ id: string; title: string; workflowId: string | null; updatedAt: string }>>([])
-  const [agentProvider, setAgentProvider] = useState<AgentProviderStatus>({ provider: 'disabled', label: 'モデルAPI未設定', configured: false })
   const [run, setRun] = useState<WorkflowRun>()
   const [notice, setNotice] = useState<string>()
   const [chatOpen, setChatOpen] = useState(true)
@@ -386,6 +127,7 @@ export function App() {
   const [operationsOpen, setOperationsOpen] = useState(false)
   const [workflowManagerOpen, setWorkflowManagerOpen] = useState(false)
   const [messages, setMessages] = useState<ChatViewMessage[]>([])
+  const [activeToolCalls, setActiveToolCalls] = useState<AgentToolActivity[]>([])
   const [conversationId, setConversationId] = useState<string>()
   const [proposal, setProposal] = useState<Extract<AgentResponse, { state: 'proposal' }>>()
   const [runApproval, setRunApproval] = useState<{ id: string; expiresAt: string; summary: Record<string, unknown>; saved: SavedWorkflow }>()
@@ -415,7 +157,6 @@ export function App() {
       setCatalogs(bootstrap.catalogs)
       setWorkflowLibrary(bootstrap.workflows)
       setConversations(bootstrap.conversations)
-      setAgentProvider(bootstrap.agent)
       const latest = bootstrap.workflows[0]
       dispatchWorkflow({ type: 'reset', workflow: latest?.workflow ?? instantiateWorkflowTemplate(bootstrap.workflowTemplate) })
       if (latest) {
@@ -459,12 +200,16 @@ export function App() {
   const activeSourceId = workflow.steps.find((step) => step.kind === 'query')?.config.source
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId)
   const availableInputs = selectedStep
-    ? workflow.steps.slice(0, workflow.steps.findIndex((step) => step.id === selectedStep.id)).filter((step) => step.kind !== 'csv')
+    ? workflow.steps.slice(0, workflow.steps.findIndex((step) => step.id === selectedStep.id)).filter((step) => {
+      const actual = outputDataModel(workflow, dataSources, step.id)
+      const required = requiredInputDataModel(selectedStep.kind)
+      return step.kind !== 'csv' && (required === 'any' || required === actual)
+    })
     : []
-  const selectedInputFields = selectedStep && 'input' in selectedStep ? fieldsForStep(workflow, catalogs, selectedStep.input) : []
-  const aggregateFields = selectedStep?.kind === 'aggregate' ? fieldsForStep(workflow, catalogs, selectedStep.input) : []
-  const leftJoinFields = selectedStep && (selectedStep.kind === 'joinAggregate' || selectedStep.kind === 'join') ? fieldsForStep(workflow, catalogs, selectedStep.inputs.left) : []
-  const rightJoinFields = selectedStep && (selectedStep.kind === 'joinAggregate' || selectedStep.kind === 'join') ? fieldsForStep(workflow, catalogs, selectedStep.inputs.right) : []
+  const selectedInputFields = selectedStep && 'input' in selectedStep ? fieldsForStep(workflow, catalogs, dataSources, selectedStep.input) : []
+  const aggregateFields = selectedStep?.kind === 'aggregate' ? fieldsForStep(workflow, catalogs, dataSources, selectedStep.input) : []
+  const leftJoinFields = selectedStep && (selectedStep.kind === 'joinAggregate' || selectedStep.kind === 'join') ? fieldsForStep(workflow, catalogs, dataSources, selectedStep.inputs.left) : []
+  const rightJoinFields = selectedStep && (selectedStep.kind === 'joinAggregate' || selectedStep.kind === 'join') ? fieldsForStep(workflow, catalogs, dataSources, selectedStep.inputs.right) : []
   const workflowDirty = !savedWorkflow || savedWorkflow.workflow.id !== workflow.id
     || !workflowsEqual(savedWorkflow.workflow, workflow)
 
@@ -547,28 +292,62 @@ export function App() {
     setPrompt('')
     setPlanning(true)
     setProposal(undefined)
+    setActiveToolCalls([])
+    const toolCalls = new Map<string, AgentToolActivity>()
     const clientMessageId = crypto.randomUUID()
     setMessages((items) => [...items, { id: `local-user-${clientMessageId}`, role: 'user', text: trimmed }])
     try {
       if (!auth) throw new Error('ログインが必要です。')
-      const result = await respondToAgent(auth, { message: trimmed, workflow, conversationId, clientMessageId })
-      setCatalogs((await loadCatalogs(auth)).catalogs)
-      const { conversationId: nextConversationId, provider: _provider, ...metadata } = result
+      const result = await respondToAgent(auth, { message: trimmed, workflow, conversationId, clientMessageId }, (activity) => {
+        toolCalls.set(activity.id, activity)
+        setActiveToolCalls([...toolCalls.values()])
+      })
+      setCatalogs((await loadCatalogs()).catalogs)
+      const { conversationId: nextConversationId, ...metadata } = result
       setConversationId(nextConversationId)
-      setMessages((items) => [...items, { id: `local-agent-${clientMessageId}`, role: 'agent', text: result.message, metadata }])
+      setMessages((items) => [...items, {
+        id: `local-agent-${clientMessageId}`,
+        role: 'agent',
+        text: result.message,
+        metadata,
+        toolCalls: result.toolCalls,
+      }])
       if (result.state === 'proposal') setProposal(result)
       setConversations((items) => [{ id: nextConversationId, title: items.find((item) => item.id === nextConversationId)?.title ?? trimmed.slice(0, 80),
         workflowId: items.find((item) => item.id === nextConversationId)?.workflowId ?? null, updatedAt: new Date().toISOString() },
       ...items.filter((item) => item.id !== nextConversationId)])
     } catch (error) {
-      setMessages((items) => [...items, { id: `local-error-${clientMessageId}`, role: 'system',
-        text: error instanceof Error ? error.message : String(error) }])
+      setMessages((items) => [...items, {
+        id: `local-error-${clientMessageId}`,
+        role: 'system',
+        text: error instanceof Error ? error.message : String(error),
+        toolCalls: [...toolCalls.values()],
+      }])
     } finally {
       setPlanning(false)
+      setActiveToolCalls([])
     }
   }
 
-  async function applyProposal() {
+  async function runSavedWorkflow(saved: SavedWorkflow) {
+    if (!auth) throw new Error('ログインが必要です。')
+    if (saved.workflow.steps.some((step) => step.kind === 'csv')) {
+      const approval = await requestWorkflowRunApproval(auth, saved.workflow.id, saved.version)
+      setRunApproval({ ...approval, saved })
+      return
+    }
+    const result = await executeWorkflow(auth, saved.workflow.id, saved.version, undefined, conversationId)
+    setRun(result.run)
+    setMessages((items) => [...items, {
+      id: `workflow-run-${result.run.id}`,
+      role: 'system',
+      text: `「${saved.workflow.name}」を実行しました。`,
+      run: result.run,
+    }])
+    setNotice(`${result.run.steps.length}ステップを ${result.run.durationMs}ms で実行しました。`)
+  }
+
+  async function applyProposal(runAfterApply = false) {
     if (!auth || !proposal) return
     setPlanning(true)
     try {
@@ -587,6 +366,7 @@ export function App() {
         ? { ...item, workflowId: saved.workflow.id, updatedAt: new Date().toISOString() } : item))
       setWorkflowLibrary((items) => [{ workflow: saved.workflow, version: saved.version, status: saved.status, updatedAt: saved.updatedAt },
         ...items.filter((item) => item.workflow.id !== saved.workflow.id)])
+      if (runAfterApply) await runSavedWorkflow(saved)
     } catch (error) { setMessages((items) => [...items, { id: `system-apply-error-${Date.now()}`, role: 'system', text: error instanceof Error ? error.message : String(error) }]) }
     finally { setPlanning(false) }
   }
@@ -633,14 +413,7 @@ export function App() {
       const saved = savedWorkflow?.workflow.id === workflow.id && workflowsEqual(savedWorkflow.workflow, workflow)
         ? savedWorkflow : await persistWorkflow()
       if (!saved.validation.valid) throw new Error(saved.validation.errors.join(' '))
-      if (saved.workflow.steps.some((step) => step.kind === 'csv')) {
-        const approval = await requestWorkflowRunApproval(auth, saved.workflow.id, saved.version)
-        setRunApproval({ ...approval, saved })
-      } else {
-        const result = await executeWorkflow(auth, saved.workflow.id, saved.version)
-        setRun(result.run)
-        setNotice(`${result.run.steps.length}ステップを ${result.run.durationMs}ms で実行しました。`)
-      }
+      await runSavedWorkflow(saved)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     } finally {
@@ -653,38 +426,33 @@ export function App() {
     const pending = runApproval
     setExecuting(true); setNotice(undefined)
     try {
-      const result = await executeWorkflow(auth, pending.saved.workflow.id, pending.saved.version, pending.id)
+      const result = await executeWorkflow(auth, pending.saved.workflow.id, pending.saved.version, pending.id, conversationId)
       setRun(result.run); setRunApproval(undefined)
+      setMessages((items) => [...items, {
+        id: `workflow-run-${result.run.id}`,
+        role: 'system',
+        text: `「${pending.saved.workflow.name}」を実行しました。`,
+        run: result.run,
+      }])
       setNotice(`${result.run.steps.length}ステップを ${result.run.durationMs}ms で実行しました。`)
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) }
     finally { setExecuting(false) }
   }
 
-  function updateStepConfig(key: string, value: unknown) {
-    if (!selectedId) return
-    setWorkflow((current) => ({
-      ...current,
-      steps: current.steps.map((step) => step.id === selectedId
-        ? ({ ...step, config: { ...step.config, [key]: value } } as WorkflowStep)
-        : step),
-    }))
-    setRun(undefined)
-  }
-
   function addStep(kind: WorkflowStep['kind']) {
-    const id = `${kind}-${Date.now().toString(36)}`
+    const id = createWorkflowStepId(kind)
     if (kind === 'query') {
-      const step: WorkflowStep = { id, kind, title: 'データソースから取得', config: { source: 'unconfigured', parameters: {} } }
+      const step: WorkflowStep = { id, kind, title: 'データソースから取得', config: { source: 'unconfigured', parameters: {}, template: null } }
       setWorkflow((current) => ({ ...current, steps: [...current.steps, step] }))
       setSelectedId(id)
       return
     }
     if (kind === 'joinAggregate' || kind === 'join') {
-      const candidates = workflow.steps.filter((step) => step.kind !== 'csv')
+      const candidates = workflow.steps.filter((step) => outputDataModel(workflow, dataSources, step.id) === 'table')
       if (candidates.length < 2) { setNotice('結合には、先に2つ以上のデータ取得・変換ノードが必要です。'); return }
       const [left, right] = candidates.slice(-2)
-      const leftFields = fieldsForStep(workflow, catalogs, left.id)
-      const rightFields = fieldsForStep(workflow, catalogs, right.id)
+      const leftFields = fieldsForStep(workflow, catalogs, dataSources, left.id)
+      const rightFields = fieldsForStep(workflow, catalogs, dataSources, right.id)
       const leftSourceIds = sourceIdsForStep(workflow, left.id)
       const rightSourceIds = new Set(sourceIdsForStep(workflow, right.id))
       const suggestedRelationship = catalogs.filter((catalog) => leftSourceIds.includes(catalog.sourceId))
@@ -700,12 +468,26 @@ export function App() {
       setSelectedId(id)
       return
     }
-    const input = [...workflow.steps].reverse().find((step) => step.kind !== 'csv')?.id
-    if (!input) return
-    const inputFields = fieldsForStep(workflow, catalogs, input)
+    const required = requiredInputDataModel(kind)
+    const input = [...workflow.steps].reverse().find((step) => {
+      const actual = outputDataModel(workflow, dataSources, step.id)
+      return step.kind !== 'csv' && (required === 'any' || required === actual)
+    })?.id
+    if (!input) {
+      setNotice(kind === 'parseDocuments'
+        ? '先にJSONライク形式を出力するデータ取得ノードを追加してください。'
+        : 'このノードには表形式の入力が必要です。JSONライク形式は先に「表形式に変換」してください。')
+      return
+    }
+    const inputFields = fieldsForStep(workflow, catalogs, dataSources, input)
     const firstField = inputFields[0]?.path ?? 'value'
     const numericField = inputFields.find((field) => field.dataTypes.includes('number'))?.path ?? firstField
-    const step: WorkflowStep = kind === 'filterSelect'
+    const step: WorkflowStep = kind === 'parseDocuments'
+      ? { id, kind, title: 'JSONライク形式を表形式に変換', input, config: {
+        recordPath: '$', columns: [{ name: 'value', path: '$.value', dataType: 'string' }],
+        onMissing: 'null', onTypeMismatch: 'error',
+      } }
+      : kind === 'filterSelect'
       ? { id, kind, title: '行を絞り込み・列を選択', input, config: { columns: [], filters: [] } }
       : kind === 'derive'
         ? { id, kind, title: '計算列を追加', input, config: { output: 'calculated_value', operation: 'toNumber', source: firstField, operandField: null, operandValue: null } }
@@ -758,7 +540,7 @@ export function App() {
 
   function createWorkflow() {
     const next: Workflow = { version: 1, id: `wf_${crypto.randomUUID().replaceAll('-', '')}`, name: '名称未設定のWorkflow',
-      description: '', steps: [{ id: 'source-1', kind: 'query', title: 'データソースから取得', config: { source: 'unconfigured', parameters: {} } }] }
+      description: '', steps: [{ id: 'source-1', kind: 'query', title: 'データソースから取得', config: { source: 'unconfigured', parameters: {}, template: null } }] }
     dispatchWorkflow({ type: 'reset', workflow: next }); setSavedWorkflow(undefined); setWorkflowVersions([]); setRun(undefined); setSelectedId('source-1')
   }
 
@@ -787,11 +569,19 @@ export function App() {
     const conversation = await loadConversation(id)
     setConversationId(conversation.id)
     setProposal(undefined)
-    setMessages(conversation.messages.map((message) => ({ id: message.id,
-      role: message.role === 'assistant' ? 'agent' : message.role,
-      text: message.content,
-      metadata: message.role === 'assistant' && message.metadata && typeof message.metadata === 'object'
-        && 'state' in message.metadata ? message.metadata as ChatViewMessage['metadata'] : undefined })))
+    setMessages(conversation.messages.map((message) => {
+      const metadata = message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
+        ? message.metadata as Record<string, unknown> : undefined
+      return {
+        id: message.id,
+        role: message.role === 'assistant' ? 'agent' as const : message.role,
+        text: message.content,
+        metadata: message.role === 'assistant' && metadata && 'state' in metadata
+          ? metadata as ChatViewMessage['metadata'] : undefined,
+        run: message.role === 'system' && metadata?.type === 'workflow_run' && metadata.run
+          ? metadata.run as WorkflowRun : undefined,
+      }
+    }))
   }
 
   function newConversation() {
@@ -827,12 +617,13 @@ export function App() {
         </div>
       </aside>
 
-      {chatOpen && <ChatWorkspace provider={agentProvider} workflow={workflow} dataSources={dataSources}
-        conversations={conversations} conversationId={conversationId} messages={messages} proposal={proposal} run={run}
-        planning={planning} executing={executing} prompt={prompt} onPromptChange={setPrompt} onSend={(message) => void sendPrompt(message)}
+      {chatOpen && <ChatWorkspace workflow={workflow} dataSources={dataSources}
+        conversations={conversations} conversationId={conversationId} messages={messages} proposal={proposal}
+        planning={planning} activeToolCalls={activeToolCalls} executing={executing} prompt={prompt} onPromptChange={setPrompt} onSend={(message) => void sendPrompt(message)}
         onNewConversation={newConversation} onOpenConversation={(id) => void openConversation(id)} onOpenWorkflow={openWorkflowView}
         onRunWorkflow={() => void execute()}
-        onApplyProposal={() => void applyProposal()} onDiscardProposal={() => setProposal(undefined)} />}
+        onApplyProposal={() => void applyProposal()} onApplyProposalAndRun={() => void applyProposal(true)}
+        onDiscardProposal={() => setProposal(undefined)} />}
 
       {!chatOpen && <section className="workspace">
         <header className="topbar">
@@ -843,7 +634,6 @@ export function App() {
               {workflowVersions.map((item) => <option value={item.version} key={item.version}>v{item.version}{item.version === workflowVersions[0]?.version ? '（最新）' : ''}</option>)}</select>}
             <button className="toolbar-button new-workflow-button" onClick={createWorkflow}><Plus size={16} /><span>新規Workflow</span></button></div>
           <div className="top-actions">
-            <span className="mcp-pill" title="MCPはBFFからインスタンス内部だけで利用されます"><span /> INTERNAL MCP · READ ONLY</span>
             <div className="history-actions">
               <button className="toolbar-button" title="元に戻す (⌘Z)" disabled={workflowHistory.past.length === 0} onClick={() => { dispatchWorkflow({ type: 'undo' }); setRun(undefined) }}><Undo2 size={16} /><span>元に戻す</span></button>
               <button className="toolbar-button" title="やり直す (⇧⌘Z)" disabled={workflowHistory.future.length === 0} onClick={() => { dispatchWorkflow({ type: 'redo' }); setRun(undefined) }}><Redo2 size={16} /><span>やり直す</span></button>
@@ -877,7 +667,7 @@ export function App() {
             <ReactFlow
               nodes={nodes}
               edges={edges}
-              nodeTypes={nodeTypes}
+              nodeTypes={workflowNodeTypes}
               onNodesChange={onNodesChange}
               onNodesDelete={onNodesDelete}
               onBeforeDelete={onBeforeDelete}
@@ -896,13 +686,14 @@ export function App() {
             >
               <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#353931" />
               <LabeledFlowControls />
-              <MiniMap pannable zoomable nodeColor={(node) => kindMeta[(node.data as WorkflowNodeData).kind].color} />
+              <MiniMap pannable zoomable nodeColor={(node) => workflowNodeMeta[(node.data as WorkflowNodeData).kind].color} />
             </ReactFlow>
 
             <div className="node-toolbar">
               <div className="node-toolbar-title"><Plus size={15} /><span>ノードを追加</span></div>
               <div className="node-toolbar-actions">
                 <button className="primary" onClick={() => addStep('query')}><Database size={15} /><span>データ取得</span></button>
+                <button onClick={() => addStep('parseDocuments')}><Braces size={15} /><span>表形式に変換</span></button>
                 <button onClick={() => addStep('filterSelect')}><ListFilter size={15} /><span>絞り込み・列選択</span></button>
                 <button onClick={() => addStep('derive')}><Calculator size={15} /><span>計算列</span></button>
                 <button onClick={() => addStep('join')}><GitMerge size={15} /><span>データ結合</span></button>
@@ -916,65 +707,25 @@ export function App() {
 
             {selectedEdge && <div className="edge-toolbar"><span>接続を選択中</span><button onClick={deleteSelectedEdge}><Link2Off size={14} /> 接続を削除</button><small>Deleteキーでも削除できます</small></div>}
 
-            {selectedStep && (
-              <aside className="inspector">
-                <div className="inspector-head"><div><span>NODE SETTINGS</span><strong>{selectedStep.title}</strong></div><button className="panel-close-button" onClick={() => setSelectedId(null)}><X size={14} /><span>閉じる</span></button></div>
-                <label>表示名<input value={selectedStep.title} onChange={(event) => setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === selectedStep.id ? { ...step, title: event.target.value } : step) }))} /></label>
-                {selectedStep.kind === 'query' && <>
-                  <label>登録済み接続<select value={selectedStep.config.source} onChange={(e) => updateStepConfig('source', e.target.value)}><option value="unconfigured" disabled>接続を選択</option>{dataSources.map((source) => <option value={source.id} key={source.id}>{source.name}</option>)}</select></label>
-                  {auth.applicationRole === 'admin'
-                    ? <button className="register-inline" onClick={() => setConnectionOpen(true)}><Database size={13} /> データソース管理</button>
-                    : dataSources.length === 0 && <small className="source-admin-note">接続設定は管理者が行います。</small>}
-                </>}
-                {'input' in selectedStep && <label>入力ノード<select value={selectedStep.input ?? ''} onChange={(e) => setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === selectedStep.id && 'input' in step ? { ...step, input: e.target.value || null } : step) }))}><option value="">未接続</option>{availableInputs.map((step) => <option value={step.id} key={step.id}>{step.title}</option>)}</select></label>}
-                {selectedStep.kind === 'filterSelect' && <>
-                  <label>出力する列（カンマ区切り、空欄は全列）<input value={selectedStep.config.columns.join(', ')} onChange={(e) => updateStepConfig('columns', e.target.value.split(',').map((value) => value.trim()).filter(Boolean))} /></label>
-                  <div className="filter-editor"><strong>絞り込み条件</strong>{selectedStep.config.filters.map((filter, index) => <div className="filter-row" key={index}>
-                    <input aria-label={`条件${index + 1}の列`} list={`filter-fields-${selectedStep.id}`} value={filter.field} onChange={(e) => updateStepConfig('filters', selectedStep.config.filters.map((item, itemIndex) => itemIndex === index ? { ...item, field: e.target.value } : item))} />
-                    <select aria-label={`条件${index + 1}の演算子`} value={filter.operator} onChange={(e) => updateStepConfig('filters', selectedStep.config.filters.map((item, itemIndex) => itemIndex === index ? { ...item, operator: e.target.value } : item))}>
-                      <option value="eq">等しい</option><option value="ne">等しくない</option><option value="gt">より大きい</option><option value="gte">以上</option><option value="lt">より小さい</option><option value="lte">以下</option><option value="contains">含む</option><option value="isNull">空である</option><option value="isNotNull">空でない</option>
-                    </select>
-                    {!['isNull', 'isNotNull'].includes(filter.operator) && <input aria-label={`条件${index + 1}の値`} value={filter.value === null ? '' : String(filter.value)} onChange={(e) => updateStepConfig('filters', selectedStep.config.filters.map((item, itemIndex) => itemIndex === index ? { ...item, value: e.target.value } : item))} />}
-                    <button type="button" aria-label={`条件${index + 1}を削除`} onClick={() => updateStepConfig('filters', selectedStep.config.filters.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={13} /> 削除</button>
-                  </div>)}
-                  <datalist id={`filter-fields-${selectedStep.id}`}>{selectedInputFields.map((field) => <option value={field.path} key={field.path} />)}</datalist>
-                  <button type="button" className="register-inline" onClick={() => updateStepConfig('filters', [...selectedStep.config.filters, { field: selectedInputFields[0]?.path ?? 'field', operator: 'eq', value: '' }])}><Plus size={13} /> 条件を追加</button></div>
-                </>}
-                {selectedStep.kind === 'derive' && <>
-                  <label>新しい列名<input value={selectedStep.config.output} onChange={(e) => updateStepConfig('output', e.target.value)} /></label>
-                  <CatalogFieldSelect label="元の列" value={selectedStep.config.source} fields={selectedInputFields} onChange={(value) => updateStepConfig('source', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <label>計算<select value={selectedStep.config.operation} onChange={(e) => updateStepConfig('operation', e.target.value)}><option value="toNumber">数値へ変換</option><option value="toString">文字列へ変換</option><option value="year">年を抽出</option><option value="month">月を抽出</option><option value="add">加算</option><option value="subtract">減算</option><option value="multiply">乗算</option><option value="divide">除算</option></select></label>
-                  {['add', 'subtract', 'multiply', 'divide'].includes(selectedStep.config.operation) && <><CatalogFieldSelect label="右辺の列（定数を使う場合は空欄）" value={selectedStep.config.operandField ?? ''} fields={selectedInputFields} numeric onChange={(value) => updateStepConfig('operandField', value || null)} onOpenCatalog={() => setCatalogOpen(true)} /><label>右辺の定数<input type="number" value={selectedStep.config.operandValue ?? ''} onChange={(e) => updateStepConfig('operandValue', e.target.value === '' ? null : Number(e.target.value))} /></label></>}
-                </>}
-                {selectedStep.kind === 'aggregate' && <>
-                  <CatalogFieldSelect label="グループ列" value={selectedStep.config.groupBy} fields={aggregateFields} onChange={(value) => updateStepConfig('groupBy', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <CatalogFieldSelect label="数値列" value={selectedStep.config.metric} fields={aggregateFields} numeric onChange={(value) => updateStepConfig('metric', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <label>計算<select value={selectedStep.config.operation} onChange={(e) => updateStepConfig('operation', e.target.value)}><option value="sum">合計</option><option value="average">平均</option><option value="count">件数</option><option value="min">最小</option><option value="max">最大</option></select></label>
-                </>}
-                {selectedStep.kind === 'join' && <>
-                  <label>左入力<select value={selectedStep.inputs.left ?? ''} onChange={(e) => setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === selectedStep.id && step.kind === 'join' ? { ...step, inputs: { ...step.inputs, left: e.target.value || null } } : step) }))}><option value="">未接続</option>{availableInputs.map((step) => <option value={step.id} key={step.id}>{step.title}</option>)}</select></label>
-                  <CatalogFieldSelect label="左の結合列" value={selectedStep.config.leftKey} fields={leftJoinFields} onChange={(value) => updateStepConfig('leftKey', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <label>右入力<select value={selectedStep.inputs.right ?? ''} onChange={(e) => setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === selectedStep.id && step.kind === 'join' ? { ...step, inputs: { ...step.inputs, right: e.target.value || null } } : step) }))}><option value="">未接続</option>{availableInputs.map((step) => <option value={step.id} key={step.id}>{step.title}</option>)}</select></label>
-                  <CatalogFieldSelect label="右の結合列" value={selectedStep.config.rightKey} fields={rightJoinFields} onChange={(value) => updateStepConfig('rightKey', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <label>結合方式<select value={selectedStep.config.joinType} onChange={(e) => updateStepConfig('joinType', e.target.value)}><option value="inner">内部結合（両方にある行）</option><option value="left">左結合（左の全行）</option></select></label>
-                </>}
-                {selectedStep.kind === 'joinAggregate' && <>
-                  <label>左入力<select value={selectedStep.inputs.left ?? ''} onChange={(e) => setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === selectedStep.id && step.kind === 'joinAggregate' ? { ...step, inputs: { ...step.inputs, left: e.target.value || null } } : step) }))}><option value="">未接続</option>{availableInputs.map((step) => <option value={step.id} key={step.id}>{step.title}</option>)}</select></label>
-                  <CatalogFieldSelect label="左の結合列" value={selectedStep.config.leftKey} fields={leftJoinFields} onChange={(value) => updateStepConfig('leftKey', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <CatalogFieldSelect label="左の数値列" value={selectedStep.config.metric} fields={leftJoinFields} numeric onChange={(value) => updateStepConfig('metric', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <label>右入力<select value={selectedStep.inputs.right ?? ''} onChange={(e) => setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === selectedStep.id && step.kind === 'joinAggregate' ? { ...step, inputs: { ...step.inputs, right: e.target.value || null } } : step) }))}><option value="">未接続</option>{availableInputs.map((step) => <option value={step.id} key={step.id}>{step.title}</option>)}</select></label>
-                  <CatalogFieldSelect label="右の結合列" value={selectedStep.config.rightKey} fields={rightJoinFields} onChange={(value) => updateStepConfig('rightKey', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <CatalogFieldSelect label="右のグループ列" value={selectedStep.config.groupBy} fields={rightJoinFields} onChange={(value) => updateStepConfig('groupBy', value)} onOpenCatalog={() => setCatalogOpen(true)} />
-                  <label>計算<select value={selectedStep.config.operation} onChange={(e) => updateStepConfig('operation', e.target.value)}><option value="sum">合計</option><option value="average">平均</option></select></label>
-                </>}
-                {selectedStep.kind === 'sortLimit' && <><CatalogFieldSelect label="並べ替える列" value={selectedStep.config.sortBy} fields={selectedInputFields} onChange={(value) => updateStepConfig('sortBy', value)} onOpenCatalog={() => setCatalogOpen(true)} /><label>順序<select value={selectedStep.config.direction} onChange={(e) => updateStepConfig('direction', e.target.value)}><option value="asc">昇順</option><option value="desc">降順</option></select></label><label>最大件数<input type="number" min="1" max="5000" value={selectedStep.config.limit} onChange={(e) => updateStepConfig('limit', Number(e.target.value))} /></label></>}
-                {selectedStep.kind === 'preview' && <label>表示件数<input type="number" min="1" max="100" value={selectedStep.config.limit} onChange={(e) => updateStepConfig('limit', Number(e.target.value))} /></label>}
-                {selectedStep.kind === 'csv' && <><label>ファイル名<input value={selectedStep.config.fileName} onChange={(e) => updateStepConfig('fileName', e.target.value)} /></label><label>CSVの安全モード<select value={selectedStep.config.mode} onChange={(e) => updateStepConfig('mode', e.target.value)}><option value="spreadsheet">表計算向け（数式を無効化）</option><option value="machine">システム連携向け</option></select></label></>}
-                <div className="inspector-meta"><span>STEP ID</span><code>{selectedStep.id}</code></div>
-                <button className="duplicate-button" onClick={duplicateSelected}><Plus size={14} /> ノードを複製</button>
-                <button className="delete-button" onClick={removeSelected}><Trash2 size={14} /> ノードを削除</button>
-              </aside>
-            )}
+            {selectedStep ? <NodeInspector
+              step={selectedStep}
+              availableInputs={availableInputs}
+              dataSources={dataSources}
+              selectedInputFields={selectedInputFields}
+              aggregateFields={aggregateFields}
+              leftJoinFields={leftJoinFields}
+              rightJoinFields={rightJoinFields}
+              isAdmin={auth.applicationRole === 'admin'}
+              onChange={(updated) => {
+                setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === updated.id ? updated : step) }))
+                setRun(undefined)
+              }}
+              onOpenCatalog={() => setCatalogOpen(true)}
+              onOpenConnections={() => setConnectionOpen(true)}
+              onClose={() => setSelectedId(null)}
+              onDuplicate={duplicateSelected}
+              onRemove={removeSelected}
+            /> : null}
           </div>
 
           {(notice || resultArtifact) && (
@@ -983,25 +734,31 @@ export function App() {
                 <div><span className="result-check"><Check size={16} /></span><div><strong>実行結果</strong><small>{notice}</small></div></div>
                 {csvArtifact && <ArtifactDownloadButton auth={auth} artifact={csvArtifact} />}
               </div>
-              {resultArtifact?.preview && resultArtifact.preview.length > 0 && (
-                <div className="table-scroll"><table><thead><tr>{resultArtifact.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{resultArtifact.preview.map((row, index) => <tr key={index}>{resultArtifact.columns.map((column) => { const value = row[column]; return <td key={column}><code className="json-cell">{typeof value === 'number' ? value.toLocaleString('ja-JP') : typeof value === 'object' ? JSON.stringify(value) : String(value)}</code></td> })}</tr>)}</tbody></table></div>
+              {resultArtifact?.type === 'documents' && resultArtifact.preview && resultArtifact.preview.length > 0
+                ? <div className="table-scroll"><pre className="json-cell">{JSON.stringify(resultArtifact.preview, null, 2)}</pre></div>
+                : resultArtifact?.preview && resultArtifact.preview.length > 0 && (
+                <div className="table-scroll"><table><thead><tr>{resultArtifact.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{resultArtifact.preview.map((row, index) => <tr key={index}>{resultArtifact.columns.map((column) => { const value = typeof row === 'object' && row !== null && !Array.isArray(row) ? row[column] : null; return <td key={column}><code className="json-cell">{typeof value === 'number' ? value.toLocaleString('ja-JP') : typeof value === 'object' ? JSON.stringify(value) : String(value)}</code></td> })}</tr>)}</tbody></table></div>
               )}
             </section>
           )}
         </div>
       </section>}
 
-      {connectionOpen && auth.applicationRole === 'admin' && <ConnectionManager auth={auth} sources={dataSources} onChange={(next) => {
-        const added = next.find((source) => !dataSources.some((current) => current.id === source.id))
-        setDataSources(next)
-        if (added && selectedStep?.kind === 'query' && selectedStep.config.source === 'unconfigured') updateStepConfig('source', added.id)
+      {connectionOpen && auth.applicationRole === 'admin' && <ConnectionManager auth={auth} onSaved={(source, isNew) => {
+        setDataSources((items) => isNew ? [...items, source] : items.map((item) => item.id === source.id ? source : item))
+        if (isNew && selectedStep?.kind === 'query' && selectedStep.config.source === 'unconfigured') {
+          setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.id === selectedStep.id && step.kind === 'query'
+            ? { ...step, config: { ...step.config, source: source.id } } : step) }))
+          setRun(undefined)
+        }
       }} onDeleted={(id) => {
+        setDataSources((items) => items.filter((source) => source.id !== id))
         setWorkflow((current) => ({ ...current, steps: current.steps.map((step) => step.kind === 'query' && step.config.source === id
           ? { ...step, config: { ...step.config, source: 'unconfigured' } } : step) }))
         setRun(undefined)
       }} onClose={() => setConnectionOpen(false)} />}
       {catalogOpen && <Suspense fallback={<div className="modal-backdrop"><div className="catalog-loading"><LoaderCircle className="spin" />Data Catalogを読み込んでいます</div></div>}>
-        <CatalogManager auth={auth} sources={dataSources} onChange={async () => setCatalogs((await loadCatalogs(auth)).catalogs)} onClose={() => setCatalogOpen(false)} />
+        <CatalogManager auth={auth} sources={dataSources} onChange={async () => setCatalogs((await loadCatalogs()).catalogs)} onClose={() => setCatalogOpen(false)} />
       </Suspense>}
       {workflowManagerOpen && <WorkflowManager auth={auth} workflows={workflowLibrary} activeWorkflowId={workflow.id} activeDirty={workflowDirty}
         onOpen={async (id) => { if (await chooseWorkflow(id)) setWorkflowManagerOpen(false) }}

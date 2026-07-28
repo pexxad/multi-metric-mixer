@@ -6,9 +6,8 @@ import { sampleWorkflow } from '../shared/workflow'
 import type { AuthSession, WorkflowListItem } from './api'
 import { WorkflowManager } from './WorkflowManager'
 
-const auth: AuthSession = { authenticated: true, principal: { id: 'p1', displayName: 'Alice', status: 'active' },
-  workspace: { id: 'w1', name: 'Workspace', slug: 'workspace', role: 'owner', membershipVersion: 1 },
-  applicationRole: 'user', assuranceLevel: 'basic', csrfToken: 'csrf' }
+const auth: AuthSession = { authenticated: true, principal: { displayName: 'Alice' },
+  workspace: { name: 'Workspace', role: 'owner' }, applicationRole: 'user', csrfToken: 'csrf' }
 const item: WorkflowListItem = { workflow: sampleWorkflow, version: 2, status: 'ready', updatedAt: '2026-07-21T00:00:00.000Z' }
 
 describe('WorkflowManager', () => {

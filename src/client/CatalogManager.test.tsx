@@ -6,13 +6,12 @@ import { CatalogManager } from './CatalogManager'
 import type { AuthSession, DataSource } from './api'
 import type { CatalogBundle } from '../shared/catalog'
 
-const auth: AuthSession = { authenticated: true, principal: { id: 'p1', displayName: 'Alice', status: 'active' },
-  workspace: { id: 'w1', name: 'Workspace', slug: 'workspace', role: 'editor', membershipVersion: 1 },
-  applicationRole: 'user', assuranceLevel: 'basic', csrfToken: 'csrf' }
-const sources: DataSource[] = [{ id: 'sales', name: '売上', type: 'sql', driver: 'sqlite', secretId: 'local/sqlite', table: 'sales',
-  maxRows: 100, version: 1, accessMode: 'read-only', status: 'active' }]
+const auth: AuthSession = { authenticated: true, principal: { displayName: 'Alice' },
+  workspace: { name: 'Workspace', role: 'editor' }, applicationRole: 'user', csrfToken: 'csrf' }
+const sources: DataSource[] = [{ id: 'sales', name: '売上', type: 'database-table', dataModel: 'table',
+  queryTemplates: [], version: 1, accessMode: 'read-only', status: 'active' }]
 const definition = { sourceId: 'sales', displayName: '売上', description: '', policy: 'curated' as const, classification: 'internal' as const,
-  defaultTimeField: null, relationships: [], fields: [{ path: 'amount', dataTypes: ['number' as const], nullable: false, presence: 1,
+  dataModel: 'table' as const, defaultTimeField: null, relationships: [], fields: [{ path: 'amount', dataTypes: ['number' as const], nullable: false, presence: 1, repeated: false,
     businessName: '金額', description: '', unit: 'JPY', timezone: '' }] }
 const canonical = { id: 'canonical-1', sourceId: 'sales', scope: 'canonical' as const, version: 1, definition,
   schemaFingerprint: 'canonical', changeSource: 'manual' as const, createdBy: 'admin', createdAt: '2026-07-22T00:00:00.000Z' }

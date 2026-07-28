@@ -5,7 +5,8 @@ import { AppError } from '../../shared/errors'
 import type { RequestContext } from '../../shared/request-context'
 import type { ArtifactRepository, StoredArtifact } from '../persistence/artifact-repository'
 import type { DataSource } from '../persistence/data-source-repository'
-import type { JsonValue, QueryStep, TableRow } from '../../shared/workflow'
+import type { JsonValue, QueryStep } from '../../shared/workflow'
+import { renderCloudWatchQuery } from '../../shared/query-template'
 
 type DynamoReader = { send(command: GetCommand | QueryCommand | ScanCommand): Promise<Record<string, unknown>> }
 type LogsReader = { send(command: StartQueryCommand | GetQueryResultsCommand | StopQueryCommand): Promise<Record<string, unknown>> }
@@ -25,12 +26,9 @@ function jsonValue(value: unknown, depth = 0): JsonValue {
   return String(value)
 }
 
-function asRows(items: unknown[], max: number): TableRow[] {
+function asDocuments(items: unknown[], max: number): JsonValue[] {
   if (items.length > max) throw new AppError('source_row_limit', 413, `AWSレスポンスが最大行数${max}を超えました。`)
-  return items.map((item) => {
-    const value = jsonValue(item)
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : { value }
-  })
+  return items.map((item) => jsonValue(item))
 }
 
 export class DynamoDbReadConnector {
@@ -62,7 +60,7 @@ export class DynamoDbReadConnector {
       response = await client.send(new ScanCommand({ TableName: source.tableName, Limit: source.maxItems, ConsistentRead: false }))
     } else throw new AppError('dynamodb_operation_denied', 400, '許可される操作はGetItem、Query、Scanだけです。')
     const items = operation === 'GetItem' ? (response.Item ? [response.Item] : []) : (response.Items as unknown[] | undefined) ?? []
-    return this.artifacts.createTable(context, `${source.id}-response`, asRows(items, source.maxItems),
+    return this.artifacts.createDocuments(context, `${source.id}-response`, asDocuments(items, source.maxItems),
       [`source:${source.id}@${source.version}`, 'trust:untrusted', 'transport:dynamodb', `operation:${operation}`, `table:${source.tableName}`], { runId })
   }
 }
@@ -74,10 +72,12 @@ export class CloudWatchLogsReadConnector {
 
   async read(context: RequestContext, source: DataSource, config: QueryStep['config'], runId?: string): Promise<StoredArtifact> {
     if (source.type !== 'cloudwatch-logs') throw new AppError('source_type_mismatch', 400, 'CloudWatch Logs readerにはCloudWatch Logs接続が必要です。')
-    const queryString = config.parameters.query
+    const template = config.template ? source.queryTemplates.find((item) => item.id === config.template!.id) : undefined
+    const rendered = template && config.template ? renderCloudWatchQuery(template, config.template.arguments) : undefined
+    const queryString = rendered?.query ?? config.parameters.query
     if (!queryString || queryString.length > 4_096) throw new AppError('logs_query_invalid', 400, 'CloudWatch Logs Insights queryが必要です。')
-    const endTime = Number(config.parameters.endTime ?? Math.floor(Date.now() / 1000))
-    const startTime = Number(config.parameters.startTime ?? endTime - 3600)
+    const endTime = rendered?.endTime ?? Number(config.parameters.endTime ?? Math.floor(Date.now() / 1000))
+    const startTime = rendered?.startTime ?? Number(config.parameters.startTime ?? endTime - 3600)
     if (!Number.isInteger(startTime) || !Number.isInteger(endTime) || endTime <= startTime || endTime - startTime > source.maxRangeSeconds) {
       throw new AppError('logs_time_range_invalid', 400, '検索期間が不正または接続の上限を超えています。')
     }
@@ -90,8 +90,11 @@ export class CloudWatchLogsReadConnector {
       if (result.status === 'Complete') {
         const rows = ((result.results as Array<Array<{ field?: string; value?: string }>> | undefined) ?? [])
           .map((row) => Object.fromEntries(row.filter((field) => field.field).map((field) => [field.field!, field.value ?? ''])))
-        return this.artifacts.createTable(context, `${source.id}-response`, asRows(rows, source.maxResults),
-          [`source:${source.id}@${source.version}`, 'trust:untrusted', 'transport:cloudwatch-logs', `range:${startTime}-${endTime}`], { runId })
+        const provenance = [`source:${source.id}@${source.version}`, 'trust:untrusted', 'transport:cloudwatch-logs',
+          `range:${startTime}-${endTime}`, ...(template ? [`query-template:${template.id}`] : [])]
+        return template?.outputDataModel === 'table'
+          ? this.artifacts.createTable(context, `${source.id}-response`, rows, provenance, { runId })
+          : this.artifacts.createDocuments(context, `${source.id}-response`, asDocuments(rows, source.maxResults), provenance, { runId })
       }
       if (terminal.has(String(result.status))) throw new AppError('logs_query_failed', 502, `CloudWatch Logs queryは${String(result.status)}で終了しました。`)
       await new Promise((resolve) => setTimeout(resolve, 200))
@@ -101,4 +104,4 @@ export class CloudWatchLogsReadConnector {
   }
 }
 
-export const awsConnectorInternals = { jsonValue, asRows }
+export const awsConnectorInternals = { jsonValue, asDocuments }

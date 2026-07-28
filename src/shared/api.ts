@@ -1,12 +1,5 @@
-import type { ArtifactSummary, Workflow } from './workflow'
-
-export type AgentProviderStatus = {
-  provider: 'openai-compatible' | 'disabled'
-  label: string
-  configured: boolean
-  model?: string
-  transportSecurity?: 'https' | 'loopback-http' | 'private-http'
-}
+import type { CatalogField, CatalogRelationship } from './catalog'
+import type { ArtifactSummary, Workflow, WorkflowRun } from './workflow'
 
 export type AgentQuestion = {
   id: string
@@ -21,11 +14,23 @@ export type AgentPlan = {
   warnings: string[]
 }
 
+export type AgentWorkflowRun = Omit<WorkflowRun, 'steps'> & {
+  stepCount: number
+}
+
+export type AgentToolActivity = {
+  id: string
+  tool: string
+  label: string
+  status: 'running' | 'completed' | 'failed'
+  durationMs?: number
+}
+
 type AgentResponseBase = {
   message: string
   changes: string[]
-  provider: AgentProviderStatus
   conversationId: string
+  toolCalls: AgentToolActivity[]
 }
 
 export type AgentClarificationResponse = AgentResponseBase & {
@@ -52,16 +57,21 @@ export type AgentUnsupportedResponse = AgentResponseBase & {
 
 export type AgentAnswerResponse = AgentResponseBase & {
   state: 'answer'
-  reason: string
-}
-
-export type AgentSampleResponse = AgentResponseBase & {
-  state: 'sample'
   sourceIds: string[]
-  limit: number
   reason: string
-  artifact: ArtifactSummary
+  artifacts: ArtifactSummary[]
+  workflowRun?: AgentWorkflowRun
+  catalogs: Array<{
+    sourceId: string
+    displayName: string
+    description: string
+    dataModel: 'table' | 'documents'
+    scope: 'canonical' | 'personal'
+    version: number
+    fields: CatalogField[]
+    relationships: CatalogRelationship[]
+  }>
 }
 
-export type AgentResponse = AgentAnswerResponse | AgentSampleResponse | AgentClarificationResponse | AgentExplorationResponse
+export type AgentResponse = AgentAnswerResponse | AgentClarificationResponse | AgentExplorationResponse
   | AgentUnsupportedResponse | AgentProposalResponse

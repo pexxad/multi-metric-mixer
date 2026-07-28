@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { CatalogDataType, CatalogField, CatalogObservation } from '../shared/catalog'
 import type { JsonValue, TableRow } from '../shared/workflow'
+import type { DataModel } from '../shared/data-source'
 
 type FieldStats = { types: Set<CatalogDataType>; rows: Set<number>; nullSeen: boolean }
 
@@ -30,18 +31,30 @@ function inspectValue(value: JsonValue, path: string, rowIndex: number, fields: 
   }
 }
 
-export function profileCatalogRows(sourceId: string, rows: TableRow[], rowCount: number, observedAt = new Date().toISOString()): CatalogObservation {
-  const sample = rows.slice(0, 100)
+export function profileCatalogValues(sourceId: string, dataModel: DataModel, values: JsonValue[], rowCount: number,
+  observedAt = new Date().toISOString()): CatalogObservation {
+  const sample = values.slice(0, 100)
   const stats = new Map<string, FieldStats>()
-  sample.forEach((row, rowIndex) => Object.entries(row).forEach(([path, value]) => inspectValue(value, path, rowIndex, stats, 0)))
+  sample.forEach((value, rowIndex) => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      Object.entries(value).forEach(([path, field]) => dataModel === 'documents'
+        ? inspectValue(field, path, rowIndex, stats, 0)
+        : inspectValue(field, path, rowIndex, stats, 8))
+    } else if (dataModel === 'documents') inspectValue(value, '$', rowIndex, stats, 0)
+  })
   const fields: CatalogField[] = [...stats.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([path, value]) => ({
     path,
     dataTypes: [...value.types].sort(compareTypes),
     nullable: value.nullSeen || value.rows.size < sample.length,
     presence: sample.length === 0 ? 0 : value.rows.size / sample.length,
+    repeated: path.includes('[]'),
     businessName: '', description: '', unit: '', timezone: '', firstSeenAt: observedAt, lastSeenAt: observedAt,
   }))
   const schemaFingerprint = createHash('sha256')
     .update(JSON.stringify(fields.map(({ path, dataTypes, nullable }) => ({ path, dataTypes, nullable })))).digest('hex')
-  return { sourceId, observedAt, rowCount, sampledRows: sample.length, schemaFingerprint, fields }
+  return { sourceId, observedAt, rowCount, sampledRows: sample.length, schemaFingerprint, dataModel, fields }
+}
+
+export function profileCatalogRows(sourceId: string, rows: TableRow[], rowCount: number, observedAt = new Date().toISOString()): CatalogObservation {
+  return profileCatalogValues(sourceId, 'table', rows, rowCount, observedAt)
 }

@@ -15,9 +15,7 @@ export const backendStorageSchema = z.discriminatedUnion('driver', [
 
 export type BackendStorageConfig = z.infer<typeof backendStorageSchema>
 
-export type SourceSecretsConfig =
-  | { provider: 'file'; filePath: string }
-  | { provider: 'aws-secrets-manager'; awsRegion: string; prefix: string }
+export type ConnectionProfilesConfig = { filePath: string }
 
 export type BackendCoreConfig = {
   backendStorage: BackendStorageConfig
@@ -26,5 +24,4 @@ export type BackendCoreConfig = {
     allowedPrivateHosts: string[]
     allowedHttpHosts: string[]
   }
-  sourceSecrets: SourceSecretsConfig
 }

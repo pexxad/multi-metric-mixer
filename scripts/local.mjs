@@ -2,8 +2,8 @@ import { copyFile, chmod, mkdir } from 'node:fs/promises'
 import { spawn, spawnSync } from 'node:child_process'
 
 await mkdir('.data', { recursive: true, mode: 0o700 })
-await copyFile('local/source-secrets.json', '.data/local-source-secrets.json')
-await chmod('.data/local-source-secrets.json', 0o600)
+await copyFile('local/connection-profiles.json', '.data/local-connection-profiles.json')
+await chmod('.data/local-connection-profiles.json', 0o600)
 
 const compose = spawnSync('docker', ['compose', '-f', 'local/compose.yaml', 'up', '-d', '--wait'], { stdio: 'inherit' })
 if (compose.error || compose.status !== 0) {

@@ -5,10 +5,10 @@ import { AppError, toProblemDetails } from '../shared/errors'
 import { dataSourceRegistrationSchema } from '../backend-core/persistence/data-source-repository'
 import { catalogDefinitionSchema } from '../shared/catalog'
 import { workflowSchema } from '../shared/workflow'
-import { contentHash } from '../shared/canonical-hash'
-import { BackendCapabilityVerifier, bearerToken } from '../shared/backend-capability'
-import { validateWorkflow } from '../shared/workflow-validation'
+import { BackendAccessTokenVerifier, bearerToken } from '../shared/backend-access-token'
 import { DataSourceAdminService } from './data-source-admin-service'
+import type { ConnectionProfileRegistry } from './connection-profile-registry'
+import { dataSourceCapability } from '../shared/data-source'
 
 const requestSchema = z.object({
   operation: z.string().min(1),
@@ -16,20 +16,24 @@ const requestSchema = z.object({
 }).strict()
 
 const adminOperations = new Set([
+  'dataSource.listAdmin',
   'dataSource.register',
   'dataSource.update',
   'dataSource.archive',
+  'dataSource.test',
   'upload.ingestAndRegister',
+  'connectionProfile.list',
 ])
 
 export function createBackendApiAdapter(options: {
   expectedHost: string
   expectedOrigin: string
-  verifier: BackendCapabilityVerifier
+  verifier: BackendAccessTokenVerifier
   core: BackendCore
+  connectionProfiles: ConnectionProfileRegistry
 }) {
   const app = new Hono()
-  const connectionAdmin = new DataSourceAdminService(options.core.database)
+  const connectionAdmin = new DataSourceAdminService(options.core.database, options.connectionProfiles)
 
   app.onError((error, c) => {
     const problem = toProblemDetails(error)
@@ -40,14 +44,12 @@ export function createBackendApiAdapter(options: {
     if (c.req.header('Host') !== options.expectedHost || c.req.header('Origin') !== options.expectedOrigin) {
       throw new AppError('invalid_internal_caller', 403, '内部APIの呼び出し元が一致しません。')
     }
+    const requestId = z.string().min(1).max(200).parse(c.req.header('X-Request-Id'))
     const raw = await c.req.text()
     const request = requestSchema.parse(JSON.parse(raw))
     const scopes = ['backend:api', ...(adminOperations.has(request.operation) ? ['connections:admin'] : [])]
-    const context = options.verifier.verify(bearerToken(c.req.header('Authorization')), {
-      action: `api:${request.operation}`,
-      inputHash: contentHash(JSON.parse(raw)),
-      scopes,
-    })
+    const workflowContentHash = c.req.header('X-Workflow-Content-Hash')
+    const context = await options.verifier.verify(bearerToken(c.req.header('Authorization')), scopes, requestId)
     if (adminOperations.has(request.operation) && context.applicationRole !== 'admin') {
       throw new AppError('data_source_admin_required', 403, 'データソース設定は管理者だけが変更できます。')
     }
@@ -55,9 +57,11 @@ export function createBackendApiAdapter(options: {
 
     switch (request.operation) {
       case 'dataSource.list':
+        return c.json({ value: (await options.core.sources.list(context)).map(dataSourceCapability) })
+      case 'dataSource.listAdmin':
         return c.json({ value: await options.core.sources.list(context) })
-      case 'dataSource.get':
-        return c.json({ value: await options.core.sources.get(context, z.string().parse(input.id)) })
+      case 'connectionProfile.list':
+        return c.json({ value: await options.connectionProfiles.listPublic() })
       case 'dataSource.register':
         return c.json({ value: await connectionAdmin.register(context, dataSourceRegistrationSchema.parse(input.source)) })
       case 'dataSource.update':
@@ -65,6 +69,11 @@ export function createBackendApiAdapter(options: {
           dataSourceRegistrationSchema.parse(input.source), z.number().int().positive().parse(input.expectedVersion)) })
       case 'dataSource.archive':
         return c.json({ value: await connectionAdmin.archive(context, z.string().parse(input.id)) })
+      case 'dataSource.test': {
+        const artifact = await options.core.reader.sample(context, z.string().parse(input.id),
+          z.number().int().min(1).max(100).default(10).parse(input.limit))
+        return c.json({ value: options.core.artifacts.summary(artifact) })
+      }
       case 'dataSource.connectionUsage':
         return c.json({ value: await options.core.workflows.connectionUsage(context, z.string().parse(input.id)) })
       case 'catalog.listEffective':
@@ -82,6 +91,11 @@ export function createBackendApiAdapter(options: {
       case 'catalog.promotePersonal':
         return c.json({ value: await options.core.catalogs.promotePersonal(context, z.string().parse(input.sourceId),
           z.number().int().nonnegative().optional().parse(input.expectedCanonicalVersion)) })
+      case 'catalog.explorePersonal': {
+        const { observation, catalog, artifact } = await options.core.exploration.explorePersonal(context,
+          z.string().parse(input.sourceId), z.number().int().min(1).max(100).default(100).parse(input.limit))
+        return c.json({ value: { observation, catalog, artifact: options.core.artifacts.summary(artifact) } })
+      }
       case 'workflow.list':
         return c.json({ value: await options.core.workflows.list(context) })
       case 'workflow.listVersions':
@@ -96,8 +110,15 @@ export function createBackendApiAdapter(options: {
       case 'workflow.archive':
         return c.json({ value: await options.core.workflows.archive(context, z.string().parse(input.id),
           z.number().int().positive().optional().parse(input.expectedVersion)) })
-      case 'workflow.validate':
-        return c.json({ value: validateWorkflow(input.workflow) })
+      case 'workflow.execute': {
+        const id = z.string().parse(input.id)
+        const version = z.number().int().positive().parse(input.version)
+        const saved = await options.core.workflows.require(context, id, version)
+        if (!workflowContentHash || workflowContentHash !== saved.contentHash) {
+          throw new AppError('workflow_content_hash_mismatch', 403, '承認されたWorkflow内容と保存済みversionが一致しません。')
+        }
+        return c.json({ value: await options.core.execution.execute(context, id, version) })
+      }
       case 'workflow.transfer.prepare':
         return c.json({ value: await options.core.transfers.prepare(context, z.string().parse(input.id),
           z.number().int().positive().optional().parse(input.version)) })

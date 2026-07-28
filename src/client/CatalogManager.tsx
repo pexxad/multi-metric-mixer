@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Bot, CircleAlert, Database, LoaderCircle, Plus, RotateCcw, Save, Trash2, Upload, X } from 'lucide-react'
 import type { CatalogBundle, CatalogDataType, CatalogDefinition, CatalogField, CatalogRelationship } from '../shared/catalog'
+import { dataSourceDataModel } from '../shared/data-source'
 import {
   exploreCatalog,
   loadCatalogBundle,
@@ -19,9 +20,10 @@ const classificationRank = { internal: 0, confidential: 1, restricted: 2 } as co
 
 function emptyDefinition(source: DataSource): CatalogDefinition {
   return { sourceId: source.id, displayName: source.name, description: '',
-    policy: source.type === 'sql' || source.type === 'upload-artifact' ? 'curated'
+    policy: dataSourceDataModel(source) === 'table' ? 'curated'
       : source.type === 'rest-json' ? 'hybrid' : 'evolving',
-    classification: 'internal', defaultTimeField: null, fields: [], relationships: [] }
+    classification: 'internal', dataModel: dataSourceDataModel(source),
+    defaultTimeField: null, fields: [], relationships: [] }
 }
 
 function cloneDefinition(definition: CatalogDefinition): CatalogDefinition {
@@ -41,7 +43,7 @@ export function CatalogManager({ auth, sources, onChange, onClose }: Props) {
     if (!sourceId) { setBundle(undefined); setDraft(undefined); return }
     let active = true
     setBusy('load'); setMessage(undefined)
-    void loadCatalogBundle(auth, sourceId).then((result) => {
+    void loadCatalogBundle(sourceId).then((result) => {
       if (!active) return
       setBundle(result)
       const selected = scope === 'canonical' ? result.canonical : result.personal ?? result.canonical
@@ -65,7 +67,7 @@ export function CatalogManager({ auth, sources, onChange, onClose }: Props) {
   function addField() {
     setDraft((current) => current ? { ...current, fields: [...current.fields, {
       path: `field_${current.fields.length + 1}`, dataTypes: ['string'], nullable: true, presence: 1,
-      businessName: '', description: '', unit: '', timezone: '',
+      repeated: false, businessName: '', description: '', unit: '', timezone: '',
     }] } : current)
   }
 
@@ -84,7 +86,7 @@ export function CatalogManager({ auth, sources, onChange, onClose }: Props) {
 
   async function reload(preferredScope = scope) {
     if (!sourceId || !source) return
-    const next = await loadCatalogBundle(auth, sourceId)
+    const next = await loadCatalogBundle(sourceId)
     setBundle(next); setScope(preferredScope)
     const selected = preferredScope === 'canonical' ? next.canonical : next.personal ?? next.canonical
     setDraft(selected ? cloneDefinition(selected.definition) : emptyDefinition(source))
@@ -158,6 +160,7 @@ export function CatalogManager({ auth, sources, onChange, onClose }: Props) {
         </div>
 
         <div className="catalog-version-strip">
+          <span>形式 <strong>{draft?.dataModel === 'table' ? '表形式' : 'JSONライク形式'}</strong></span>
           <span>正本 <strong>{bundle?.canonical ? `v${bundle.canonical.version}` : '未登録'}</strong></span>
           <span>自分用 <strong>{bundle?.personal ? `v${bundle.personal.version}` : 'なし'}</strong></span>
           {bundle?.personalOutdated && <em><CircleAlert size={12} />正本が更新されています</em>}
@@ -176,12 +179,14 @@ export function CatalogManager({ auth, sources, onChange, onClose }: Props) {
             <label className="catalog-description">説明<textarea rows={2} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
           </div>
 
-          <div className="catalog-fields-head"><div><strong>Fields</strong><span>{draft.fields.length}件</span></div><button onClick={addField}><Plus size={13} />fieldを追加</button></div>
-          <div className="catalog-fields"><table><thead><tr><th>Field path</th><th>型</th><th>業務名</th><th>説明</th><th>単位</th><th>Timezone</th><th>観測率</th><th /></tr></thead>
+          <div className="catalog-fields-head"><div><strong>{draft.dataModel === 'table' ? 'Columns' : 'Document fields'}</strong><span>{draft.fields.length}件</span></div><button onClick={addField}><Plus size={13} />{draft.dataModel === 'table' ? '列を追加' : 'fieldを追加'}</button></div>
+          {draft.dataModel === 'documents' && <p className="catalog-format-note">階層パス、配列、観測型と出現率を管理します。業務集計に使う列はWorkflowの「表形式に変換」ノードで定義します。</p>}
+          <div className="catalog-fields"><table><thead><tr><th>{draft.dataModel === 'table' ? '列名' : 'Field path'}</th><th>型</th>{draft.dataModel === 'documents' && <th>構造</th>}<th>業務名</th><th>説明</th><th>単位</th><th>Timezone</th><th>観測率</th><th /></tr></thead>
             <tbody>{draft.fields.map((field, index) => <tr key={`${index}-${field.path}`}>
               <td><input aria-label={`Field path ${index + 1}`} value={field.path} onChange={(event) => updateField(index, { path: event.target.value })} /></td>
               <td><select aria-label={`型 ${field.path}`} value={field.dataTypes[0]} onChange={(event) => updateField(index, { dataTypes: [event.target.value as CatalogDataType] })}>
-                {dataTypes.map((type) => <option key={type}>{type}</option>)}</select>{field.dataTypes.length > 1 && <small>観測: {field.dataTypes.join(' / ')}</small>}</td>
+                {dataTypes.filter((type) => draft.dataModel === 'documents' || !['object', 'array'].includes(type)).map((type) => <option key={type}>{type}</option>)}</select>{field.dataTypes.length > 1 && <small>観測: {field.dataTypes.join(' / ')}</small>}</td>
+              {draft.dataModel === 'documents' && <td><span>{field.repeated ? '配列要素' : field.dataTypes.includes('object') ? 'オブジェクト' : '単一値'}</span></td>}
               <td><input aria-label={`業務名 ${field.path}`} value={field.businessName} onChange={(event) => updateField(index, { businessName: event.target.value })} /></td>
               <td><input aria-label={`説明 ${field.path}`} value={field.description} onChange={(event) => updateField(index, { description: event.target.value })} /></td>
               <td><input aria-label={`単位 ${field.path}`} value={field.unit} onChange={(event) => updateField(index, { unit: event.target.value })} /></td>

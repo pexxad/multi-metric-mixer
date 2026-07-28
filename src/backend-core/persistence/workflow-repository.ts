@@ -2,22 +2,33 @@ import { randomUUID } from 'node:crypto'
 import { AppError } from '../../shared/errors'
 import type { RequestContext } from '../../shared/request-context'
 import { canEdit } from '../../shared/request-context'
-import { validateWorkflow } from '../../shared/workflow-validation'
+import { validateWorkflow, validateWorkflowDataModels, validateWorkflowQueries } from '../../shared/workflow-validation'
 import type { Workflow } from '../../shared/workflow'
 import type { BackendDatabase } from '../../backend-core/persistence/backend-database'
 import type { SavedWorkflow, WorkflowChangeSource } from '../../shared/backend-contract'
 export { contentHash } from '../../shared/canonical-hash'
 export type { SavedWorkflow, WorkflowChangeSource } from '../../shared/backend-contract'
 import { contentHash } from '../../shared/canonical-hash'
+import type { DataSourceReader } from './data-source-repository'
 
 export class WorkflowRepository {
-  constructor(private readonly database: BackendDatabase) {}
+  constructor(private readonly database: BackendDatabase, private readonly sources?: DataSourceReader) {}
 
   async save(context: RequestContext, input: unknown, source: WorkflowChangeSource, expectedVersion?: number): Promise<SavedWorkflow> {
     if (!canEdit(context)) throw new AppError('workflow_edit_denied', 403, 'WorkspaceでWorkflowを編集する権限がありません。')
     const validation = validateWorkflow(input)
     const parsed = validation.workflow
     if (!parsed) throw new AppError('workflow_schema_invalid', 400, 'Workflow定義が不正です。', validation.errors)
+    if (this.sources) {
+      const currentSources = await this.sources.list(context)
+      const pinnedSources = this.sources.getVersion ? await Promise.all(parsed.steps.flatMap((step) =>
+        step.kind === 'query' && step.config.template
+          ? [this.sources!.getVersion!(context, step.config.source, step.config.template.sourceVersion)] : [])) : []
+      const modelErrors = validateWorkflowDataModels(parsed, [...currentSources, ...pinnedSources.filter((item) => item !== undefined)])
+      validation.errors.push(...modelErrors, ...validateWorkflowQueries(parsed,
+        [...currentSources, ...pinnedSources.filter((item) => item !== undefined)]))
+      validation.valid = validation.errors.length === 0
+    }
     const hash = contentHash(parsed)
     const now = new Date().toISOString()
     const existing = await this.database.query.selectFrom('workflows').select(['workspace_id', 'current_version', 'status'])

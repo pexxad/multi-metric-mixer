@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { connectNodes, disconnectEdge, duplicateWorkflowStep, instantiateWorkflowTemplate, workflowHistoryReducer, workflowsEqual } from './App'
+import {
+  connectNodes,
+  createWorkflowStepId,
+  disconnectEdge,
+  duplicateWorkflowStep,
+  instantiateWorkflowTemplate,
+  workflowHistoryReducer,
+  workflowsEqual,
+} from './workflow-editor'
 import { sampleWorkflow } from '../shared/workflow'
 
 describe('shared Workflow editor state', () => {
@@ -13,7 +21,7 @@ describe('shared Workflow editor state', () => {
   })
 
   it('uses the same Workflow input fields for reconnect, disconnect, undo and redo', () => {
-    const source = sampleWorkflow.steps.find((step) => step.kind === 'query')!
+    const source = sampleWorkflow.steps.find((step) => step.kind === 'parseDocuments')!
     const target = sampleWorkflow.steps.find((step) => step.kind === 'preview')!
     const disconnected = disconnectEdge(sampleWorkflow, { id: 'e', source: source.id, target: target.id })
     expect(disconnected.steps.find((step) => step.id === target.id)).toMatchObject({ input: null })
@@ -29,6 +37,12 @@ describe('shared Workflow editor state', () => {
     const source = sampleWorkflow.steps[0]!
     const duplicated = duplicateWorkflowStep(sampleWorkflow, source.id, 'fetch-json-copy')
     expect(duplicated.steps[1]).toMatchObject({ id: 'fetch-json-copy', kind: source.kind, title: `${source.title} のコピー` })
+  })
+
+  it('generates schema-valid IDs for every node kind, including camel-case kinds', () => {
+    expect(createWorkflowStepId('filterSelect', 1_234_567)).toMatch(/^[a-z][a-z0-9_-]*$/)
+    expect(createWorkflowStepId('joinAggregate', 1_234_567)).toBe('join-aggregate-qglj')
+    expect(createWorkflowStepId('parseDocuments', 1_234_567)).toBe('parse-documents-qglj')
   })
 
   it('treats a server-normalized Workflow with different property order as saved', () => {

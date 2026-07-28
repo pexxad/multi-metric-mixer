@@ -15,7 +15,7 @@ export function OperationsPanel({ auth, workflows, onClose }: { auth: AuthSessio
   const workflowNames = useMemo(() => new Map(workflows.map((item) => [item.workflow.id, item.workflow.name])), [workflows])
   useEffect(() => {
     let active = true
-    void Promise.all([loadRuns(auth), loadArtifacts(auth)]).then(([runResult, artifactResult]) => {
+    void Promise.all([loadRuns(), loadArtifacts()]).then(([runResult, artifactResult]) => {
       if (active) { setRuns(runResult.runs); setArtifacts(artifactResult.artifacts) }
     }).catch((cause) => active && setError(cause instanceof Error ? cause.message : String(cause)))
       .finally(() => active && setLoading(false))

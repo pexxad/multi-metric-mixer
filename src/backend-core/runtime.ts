@@ -3,9 +3,8 @@ import { SafeHttpClient } from './connectors/safe-http'
 import { CloudWatchLogsReadConnector, DynamoDbReadConnector } from './connectors/aws'
 import { RestDataSourceService } from './connectors/rest-json'
 import { DataSourceReadService } from './connectors/read-service'
-import { SqlReadConnector, MongoDbReadConnector } from './connectors/databases'
+import { TableDatabaseReadConnector, DocumentDatabaseReadConnector } from './connectors/databases'
 import { UploadArtifactReadConnector } from './connectors/upload'
-import { createDataSourceSecretProvider } from './connectors/source-secrets'
 import { ArtifactRepository } from './persistence/artifact-repository'
 import { DataSourceQueryRepository } from './persistence/data-source-repository'
 import { CatalogRepository } from './persistence/catalog-repository'
@@ -18,15 +17,20 @@ import { WorkflowTransferService } from './workflow-transfer'
 import { UploadIngestionService } from './upload-ingestion'
 import { RunLimitService } from './run-limit-service'
 import { openBackendStorage } from './persistence/backend-storage'
+import type { DatabaseConnectionResolver } from './connectors/databases'
+import { CatalogExplorationService } from './catalog-exploration'
 
 export type BackendCore = Awaited<ReturnType<typeof createBackendCore>>
 
-export async function createBackendCore(config: BackendCoreConfig) {
+export async function createBackendCore(config: BackendCoreConfig, dependencies: {
+  databaseConnections: DatabaseConnectionResolver
+}) {
   const storage = await openBackendStorage(config.backendStorage)
   const database = storage.database
   const sourceRepository = new DataSourceQueryRepository(database)
   const sources = {
     get: sourceRepository.get.bind(sourceRepository),
+    getVersion: sourceRepository.getVersion.bind(sourceRepository),
     list: sourceRepository.list.bind(sourceRepository),
   }
   const catalogs = new CatalogRepository(database, sources)
@@ -36,7 +40,7 @@ export async function createBackendCore(config: BackendCoreConfig) {
     config.limits.artifactStorageBytes,
     config.limits.artifactRetentionDays,
   )
-  const workflows = new WorkflowRepository(database)
+  const workflows = new WorkflowRepository(database, sources)
   const runs = new RunRepository(database)
   const runLimits = new RunLimitService(database, config.limits.concurrentRunsPerWorkspace)
   const tools = new WorkflowTools(artifacts, config.limits.joinRows)
@@ -48,17 +52,17 @@ export async function createBackendCore(config: BackendCoreConfig) {
     allowedPrivateHosts: config.sourceNetwork.allowedPrivateHosts,
     allowedHttpHosts: config.sourceNetwork.allowedHttpHosts,
   })
-  const secrets = createDataSourceSecretProvider(config.sourceSecrets)
   const rest = new RestDataSourceService(artifacts, http, config.limits.sourceRows)
   const reader = new DataSourceReadService(sources, {
     'rest-json': rest,
     dynamodb: new DynamoDbReadConnector(artifacts),
     'cloudwatch-logs': new CloudWatchLogsReadConnector(artifacts),
     'upload-artifact': new UploadArtifactReadConnector(artifacts),
-    sql: new SqlReadConnector(artifacts, secrets),
-    mongodb: new MongoDbReadConnector(artifacts, secrets),
+    'database-table': new TableDatabaseReadConnector(artifacts, dependencies.databaseConnections),
+    'database-documents': new DocumentDatabaseReadConnector(artifacts, dependencies.databaseConnections),
   })
   const execution = new WorkflowExecutionService(workflows, runs, reader, tools, runLimits)
+  const exploration = new CatalogExplorationService(reader, catalogs)
   const invocations = new McpInvocationRepository(database)
   const transfers = new WorkflowTransferService(workflows)
   const uploads = new UploadIngestionService(artifacts, storage.artifacts, {
@@ -83,9 +87,9 @@ export async function createBackendCore(config: BackendCoreConfig) {
     tools,
     http,
     rest,
-    secrets,
     reader,
     execution,
+    exploration,
     invocations,
     transfers,
     uploads,

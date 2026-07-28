@@ -1,0 +1,26 @@
+{
+  "connections": [
+    {
+      "id": "db-a",
+      "displayName": "表形式DB A",
+      "dataModel": "table",
+      "uri": "postgresql://mmm_reader:local-postgres-reader@127.0.0.1:5433/metrics",
+      "tls": { "mode": "disable-loopback" },
+      "deniedDatasets": [
+        "pg_catalog.*",
+        "information_schema.*"
+      ]
+    },
+    {
+      "id": "db-c",
+      "displayName": "JSONライクDB C",
+      "dataModel": "documents",
+      "uri": "mongodb://mmm_reader:local-mongo-reader@127.0.0.1:27017/metrics?authSource=metrics",
+      "deniedDatasets": [
+        "admin.*",
+        "config.*",
+        "local.*"
+      ]
+    }
+  ]
+}

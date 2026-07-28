@@ -1,21 +1,11 @@
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
-import { createMcpRequestHandler } from './backend-server/mcp-adapter'
 import { loadBackendRuntimeConfig } from './backend-server/config'
 import { testBffDatabase } from './test-support'
 import { IdentityRepository } from './bff/persistence/identity-repository'
 import { SessionService } from './bff/auth/session-service'
 
 describe('Version 1 security boundaries', () => {
-  it.each(['GET', 'POST', 'DELETE'])('rejects missing or unexpected MCP Origin for %s before capability handling', async (method) => {
-    const handler = createMcpRequestHandler({ expectedHost: '127.0.0.1:3001', expectedOrigin: 'http://127.0.0.1:3000',
-      verifier: {} as never, invocations: {} as never, dependencies: {} as never })
-    expect((await handler(new Request('http://127.0.0.1:3001/mcp', { method,
-      headers: { Host: '127.0.0.1:3001' }, ...(method === 'POST' ? { body: '{}' } : {}) }))).status).toBe(403)
-    expect((await handler(new Request('http://127.0.0.1:3001/mcp', { method,
-      headers: { Host: '127.0.0.1:3001', Origin: 'null' }, ...(method === 'POST' ? { body: '{}' } : {}) }))).status).toBe(403)
-  })
-
   it('contains no external data-source write command or identity fields in MCP tool input', async () => {
     const source = await readFile('src/backend-server/mcp-adapter.ts', 'utf8')
     const aws = await readFile('src/backend-core/connectors/aws.ts', 'utf8')

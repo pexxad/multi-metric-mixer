@@ -1,4 +1,4 @@
-import type { ArtifactSummary, TableRow, Workflow } from './workflow'
+import type { ArtifactSummary, JsonValue, TableRow, Workflow } from './workflow'
 
 export type WorkflowChangeSource = 'manual' | 'agent' | 'import' | 'migration'
 
@@ -15,6 +15,7 @@ export type StoredArtifact = ArtifactSummary & {
   workspaceId: string
   runId?: string
   rows?: TableRow[]
+  documents?: JsonValue[]
   content?: Uint8Array
   mimeType?: string
 }

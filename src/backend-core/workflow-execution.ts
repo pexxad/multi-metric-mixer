@@ -7,6 +7,7 @@ import type { SavedWorkflow, WorkflowRepository } from './persistence/workflow-r
 import type { WorkflowTools } from './workflow-tools'
 import type { WorkflowRun } from '../shared/workflow'
 import type { RunLimitService } from './run-limit-service'
+import { canRun } from '../shared/request-context'
 
 export class WorkflowExecutionService {
   constructor(
@@ -18,6 +19,7 @@ export class WorkflowExecutionService {
   ) {}
 
   async execute(context: RequestContext, workflowId: string, version?: number): Promise<WorkflowRun> {
+    if (!canRun(context)) throw new AppError('workflow_run_denied', 403, 'Workflowを実行する権限がありません。')
     const saved = await this.workflows.require(context, workflowId, version)
     if (!saved.validation.valid) throw new AppError('workflow_not_ready', 409, '設定不足のWorkflowは実行できません。', saved.validation.errors)
     const slot = await this.runLimits.acquire(context)
@@ -50,7 +52,8 @@ export class WorkflowExecutionService {
         } else {
           const input = step.input ? artifactsByStep.get(step.input) : undefined
           if (!input) throw new AppError('workflow_input_unresolved', 400, `ステップ「${step.id}」の入力が解決できません。`)
-          if (step.kind === 'filterSelect') artifact = await this.tools.filterSelect(context, input, step.config, runId)
+          if (step.kind === 'parseDocuments') artifact = await this.tools.parseDocuments(context, input, step.config, runId)
+          else if (step.kind === 'filterSelect') artifact = await this.tools.filterSelect(context, input, step.config, runId)
           else if (step.kind === 'derive') artifact = await this.tools.derive(context, input, step.config, runId)
           else if (step.kind === 'aggregate') artifact = await this.tools.aggregate(context, input, step.config, runId)
           else if (step.kind === 'sortLimit') artifact = await this.tools.sortLimit(context, input, step.config, runId)

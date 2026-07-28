@@ -5,9 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ArtifactDownloadButton } from './ArtifactDownloadButton'
 import type { AuthSession } from './api'
 
-const auth: AuthSession = { authenticated: true, principal: { id: 'p1', displayName: 'Alice', status: 'active' },
-  workspace: { id: 'w1', name: 'Workspace', slug: 'workspace', role: 'owner', membershipVersion: 1 },
-  applicationRole: 'user', assuranceLevel: 'basic', csrfToken: 'csrf' }
+const auth: AuthSession = { authenticated: true, principal: { displayName: 'Alice' },
+  workspace: { name: 'Workspace', role: 'owner' }, applicationRole: 'user', csrfToken: 'csrf' }
 const artifact = { id: 'art-1', type: 'csv' as const, name: 'report.csv', rowCount: 2, columns: ['value'], provenance: ['test'],
   trustLevel: 'untrusted' as const, classification: 'confidential' as const, checksum: 'sha256-value', createdAt: '2026-07-21T00:00:00.000Z' }
 

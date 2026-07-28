@@ -1,17 +1,5 @@
 import { AppError } from '../shared/errors'
-import type { JsonValue, TableRow } from '../shared/workflow'
-
-function isJsonRecord(value: JsonValue): value is { [key: string]: JsonValue } {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-export function normalizeJsonToRows(value: JsonValue, maxRows = 5_000): TableRow[] {
-  const rows = Array.isArray(value)
-    ? (value.every(isJsonRecord) ? value : value.map((item, index) => ({ index, value: item })))
-    : (isJsonRecord(value) ? [value] : [{ value }])
-  if (rows.length > maxRows) throw new AppError('source_row_limit', 413, `データが最大行数${maxRows}を超えました。`)
-  return rows
-}
+import type { JsonValue } from '../shared/workflow'
 
 export function validateJsonDepth(value: JsonValue, maxDepth: number): void {
   const pending: Array<{ value: JsonValue; depth: number }> = [{ value, depth: 0 }]

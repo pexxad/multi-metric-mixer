@@ -4,10 +4,7 @@ import { exactOrigin, limitsSchema, portSchema } from '../shared/runtime-config'
 import { backendStorageSchema } from '../shared/backend-runtime-config'
 
 export const sourceNetworkSchema = z.object({ allowedPrivateHosts: z.array(z.string()), allowedHttpHosts: z.array(z.string()) })
-const sourceSecretsSchema = z.discriminatedUnion('provider', [
-  z.object({ provider: z.literal('file'), filePath: z.string().min(1) }),
-  z.object({ provider: z.literal('aws-secrets-manager'), awsRegion: z.string().min(1), prefix: z.string() }),
-])
+const connectionProfilesSchema = z.object({ filePath: z.string().min(1) })
 export const backendServerSchema = z.object({
   hostname: z.literal('127.0.0.1'),
   port: portSchema,
@@ -24,7 +21,7 @@ export const backendRuntimeConfigSchema = z.object({
   backendStorage: backendStorageSchema,
   limits: limitsSchema,
   sourceNetwork: sourceNetworkSchema,
-  sourceSecrets: sourceSecretsSchema,
+  connectionProfiles: connectionProfilesSchema,
 })
 export type BackendRuntimeConfig = z.infer<typeof backendRuntimeConfigSchema>
 
@@ -36,15 +33,7 @@ export function loadBackendRuntimeConfig(env: NodeJS.ProcessEnv = process.env): 
         artifactKmsKeyId: env.ARTIFACT_KMS_KEY_ID ?? '', awsRegion: env.AWS_REGION ?? '' }
     : { driver: 'sqlite' as const, sqlitePath: resolve(env.BACKEND_DATA_DIR ?? '.data', 'backend-v1.sqlite'),
         artifactPath: resolve(env.BACKEND_DATA_DIR ?? '.data', 'artifacts') }
-  if (env.DATA_SOURCE_SECRET_PROVIDER && !['file', 'aws-secrets-manager'].includes(env.DATA_SOURCE_SECRET_PROVIDER)) {
-    throw new Error('DATA_SOURCE_SECRET_PROVIDER must be file or aws-secrets-manager.')
-  }
-  const sourceSecrets = env.DATA_SOURCE_SECRET_PROVIDER === 'aws-secrets-manager'
-    ? { provider: 'aws-secrets-manager' as const, awsRegion: env.AWS_REGION ?? '', prefix: env.DATA_SOURCE_SECRET_PREFIX ?? '' }
-    : { provider: 'file' as const, filePath: resolve(env.DATA_SOURCE_SECRET_FILE ?? '.data/data-source-secrets.json') }
-  if (backendStorage.driver === 'postgres' && sourceSecrets.provider !== 'aws-secrets-manager') {
-    throw new Error('PostgreSQL production storage requires DATA_SOURCE_SECRET_PROVIDER=aws-secrets-manager.')
-  }
+  const connectionProfiles = { filePath: resolve(env.DATA_CONNECTION_PROFILES_FILE ?? '.data/connection-profiles.json') }
   return backendRuntimeConfigSchema.parse({
     release: env.APP_RELEASE ?? 'development',
     backendServer: { hostname: '127.0.0.1', port: backendPort,
@@ -61,6 +50,6 @@ export function loadBackendRuntimeConfig(env: NodeJS.ProcessEnv = process.env): 
       artifactRetentionDays: Number(env.ARTIFACT_RETENTION_DAYS ?? 30) },
     sourceNetwork: { allowedPrivateHosts: (env.SOURCE_ALLOWED_PRIVATE_HOSTS ?? '').split(',').map((item) => item.trim()).filter(Boolean),
       allowedHttpHosts: (env.SOURCE_ALLOWED_HTTP_HOSTS ?? '').split(',').map((item) => item.trim()).filter(Boolean) },
-    sourceSecrets,
+    connectionProfiles,
   })
 }

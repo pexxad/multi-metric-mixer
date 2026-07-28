@@ -12,6 +12,7 @@ import {
 } from '../../shared/catalog'
 import type { BackendDatabase } from '../../backend-core/persistence/backend-database'
 import type { DataSource, DataSourceReader } from './data-source-repository'
+import { dataSourceDataModel } from '../../shared/data-source'
 
 const CANONICAL_OWNER = '$canonical'
 const classificationRank = { internal: 0, confidential: 1, restricted: 2 } as const
@@ -45,8 +46,9 @@ function rowVersion(row: CatalogRow): CatalogVersion {
 }
 
 function defaultPolicy(source: DataSource): CatalogDefinition['policy'] {
-  if (source.type === 'sql' || source.type === 'upload-artifact') return 'curated'
-  if (source.type === 'dynamodb' || source.type === 'cloudwatch-logs' || source.type === 'mongodb') return 'evolving'
+  if (source.type === 'database-table' || (source.type === 'upload-artifact' && source.format === 'csv')) return 'curated'
+  if (source.type === 'dynamodb' || source.type === 'cloudwatch-logs' || source.type === 'database-documents'
+    || (source.type === 'upload-artifact' && source.format === 'json')) return 'evolving'
   return 'hybrid'
 }
 
@@ -61,7 +63,10 @@ export class CatalogRepository {
         'version.created_by', 'version.created_at'])
       .where('head.workspace_id', '=', context.workspace.id).where('head.data_source_id', '=', sourceId)
       .where('head.owner_key', '=', ownerKey).executeTakeFirst() as CatalogRow | undefined
-    return row ? rowVersion(row) : undefined
+    if (!row) return undefined
+    const version = rowVersion(row)
+    const source = await this.sources.get(context, sourceId)
+    return source ? { ...version, definition: { ...version.definition, dataModel: dataSourceDataModel(source) } } : version
   }
 
   async bundle(context: RequestContext, sourceId: string): Promise<CatalogBundle> {
@@ -96,6 +101,7 @@ export class CatalogRepository {
     if (!source) throw new AppError('source_not_found', 404, 'データソースが見つかりません。')
     let definition = catalogDefinitionSchema.parse(input)
     if (definition.sourceId !== sourceId) throw new AppError('catalog_source_mismatch', 400, 'CatalogのデータソースIDが一致しません。')
+    definition = { ...definition, dataModel: dataSourceDataModel(source) }
     const canonical = scope === 'personal' ? await this.active(context, sourceId, CANONICAL_OWNER) : undefined
     if (canonical && classificationRank[definition.classification] < classificationRank[canonical.definition.classification]) {
       definition = { ...definition, classification: canonical.definition.classification }
@@ -165,7 +171,7 @@ export class CatalogRepository {
     const definition: CatalogDefinition = {
       sourceId, displayName: previous?.displayName ?? source.name, description: previous?.description ?? '',
       policy: previous?.policy ?? defaultPolicy(source), classification: previous?.classification ?? 'internal',
-      defaultTimeField: timeField, fields, relationships: previous?.relationships ?? [],
+      dataModel: dataSourceDataModel(source), defaultTimeField: timeField, fields, relationships: previous?.relationships ?? [],
     }
     return this.savePersonal(context, sourceId, definition, bundle.personal?.version, 'agent')
   }

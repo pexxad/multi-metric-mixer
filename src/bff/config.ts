@@ -1,18 +1,19 @@
 import { z } from 'zod'
-import ipaddr from 'ipaddr.js'
 import { resolve } from 'node:path'
 import { databaseStorageSchema, exactOrigin, limitsSchema, portSchema } from '../shared/runtime-config'
 
 const providerKeySchema = z.string().min(1).max(64).regex(/^[a-z][a-z0-9_-]*$/)
 const secretSchema = z.string().min(32)
 const httpsUrlSchema = z.url().refine((value) => new URL(value).protocol === 'https:', 'must use HTTPS')
+const reasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
 const agentProviderSchema = z.discriminatedUnion('provider', [
   z.object({ provider: z.literal('disabled') }).strict(),
   z.object({ provider: z.literal('openai-compatible'), baseUrl: z.url(), model: z.string().min(1).max(200),
     apiKey: z.string().min(1).optional(), timeoutMs: z.number().int().min(1_000).max(300_000),
     maxTokens: z.number().int().min(256).max(32_768),
     contextWindowTokens: z.number().int().min(4_096).max(2_000_000),
-    transportSecurity: z.enum(['https', 'loopback-http', 'private-http']) }).strict()
+    reasoningEffort: reasoningEffortSchema.optional(),
+    transportSecurity: z.enum(['https', 'loopback-http', 'insecure-http']) }).strict()
     .refine((value) => value.maxTokens + 1_024 < value.contextWindowTokens,
       'OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS must leave at least 1024 tokens for model input.'),
 ])
@@ -38,7 +39,7 @@ export const runtimeConfigSchema = z.object({
     tokenIssuer: z.string().min(1),
     tokenKeyId: z.string().min(1),
     tokenPrivateKeyBase64: z.string().min(32),
-    tokenTtlSeconds: z.number().int().min(5).max(60),
+    tokenTtlSeconds: z.number().int().min(5).max(24 * 60 * 60),
   }),
   auth: z.object({
     providerKey: providerKeySchema, sessionTtlSeconds: z.number().int().min(300).max(24 * 60 * 60),
@@ -77,24 +78,29 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     }
     const baseUrl = new URL(env.OPENAI_COMPATIBLE_BASE_URL)
     const isLoopbackHttp = baseUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(baseUrl.hostname)
-    const isPrivateLiteralHttp = baseUrl.protocol === 'http:' && ipaddr.isValid(baseUrl.hostname)
-      && ipaddr.parse(baseUrl.hostname).kind() === 'ipv4' && ipaddr.parse(baseUrl.hostname).range() === 'private'
-    const allowPrivateHttp = env.OPENAI_COMPATIBLE_ALLOW_INSECURE_PRIVATE_HTTP === 'true'
-    if (env.OPENAI_COMPATIBLE_ALLOW_INSECURE_PRIVATE_HTTP
-      && !['true', 'false'].includes(env.OPENAI_COMPATIBLE_ALLOW_INSECURE_PRIVATE_HTTP)) {
-      throw new Error('OPENAI_COMPATIBLE_ALLOW_INSECURE_PRIVATE_HTTP must be either true or false.')
+    const allowInsecureHttp = env.OPENAI_COMPATIBLE_ALLOW_INSECURE_HTTP === 'true'
+    if (env.OPENAI_COMPATIBLE_ALLOW_INSECURE_HTTP
+      && !['true', 'false'].includes(env.OPENAI_COMPATIBLE_ALLOW_INSECURE_HTTP)) {
+      throw new Error('OPENAI_COMPATIBLE_ALLOW_INSECURE_HTTP must be either true or false.')
     }
-    if (baseUrl.protocol !== 'https:' && !isLoopbackHttp && !(isPrivateLiteralHttp && allowPrivateHttp)) {
-      throw new Error('OPENAI_COMPATIBLE_BASE_URL must use HTTPS, loopback HTTP, or explicitly approved private IPv4 HTTP.')
+    if (baseUrl.protocol !== 'https:' && baseUrl.protocol !== 'http:') {
+      throw new Error('OPENAI_COMPATIBLE_BASE_URL must use HTTPS or HTTP.')
+    }
+    if (baseUrl.protocol === 'http:' && !isLoopbackHttp && !allowInsecureHttp) {
+      throw new Error('Non-loopback HTTP requires OPENAI_COMPATIBLE_ALLOW_INSECURE_HTTP=true.')
     }
     if (baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
       throw new Error('OPENAI_COMPATIBLE_BASE_URL must not contain credentials, query, or fragment.')
     }
+    const reasoningEffort = env.OPENAI_COMPATIBLE_REASONING_EFFORT
+      ? reasoningEffortSchema.parse(env.OPENAI_COMPATIBLE_REASONING_EFFORT)
+      : undefined
     agent = { provider: 'openai-compatible', baseUrl: baseUrl.toString(), model: env.OPENAI_COMPATIBLE_MODEL,
       apiKey: env.OPENAI_COMPATIBLE_API_KEY, timeoutMs: Number(env.OPENAI_COMPATIBLE_TIMEOUT_MS ?? 60_000),
       maxTokens: Number(env.OPENAI_COMPATIBLE_MAX_TOKENS ?? 8_192),
       contextWindowTokens: Number(env.OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS ?? 32_768),
-      transportSecurity: baseUrl.protocol === 'https:' ? 'https' : isLoopbackHttp ? 'loopback-http' : 'private-http' }
+      reasoningEffort,
+      transportSecurity: baseUrl.protocol === 'https:' ? 'https' : isLoopbackHttp ? 'loopback-http' : 'insecure-http' }
   }
   return runtimeConfigSchema.parse({
     version: 1, release: env.APP_RELEASE ?? 'development',
@@ -108,7 +114,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       tokenIssuer: env.BACKEND_TOKEN_ISSUER ?? 'multi-metric-mixer-bff',
       tokenKeyId: env.BACKEND_TOKEN_KEY_ID ?? 'bff-1',
       tokenPrivateKeyBase64: env.BACKEND_TOKEN_PRIVATE_KEY_BASE64 ?? '',
-      tokenTtlSeconds: Number(env.BACKEND_TOKEN_TTL_SECONDS ?? 15),
+      tokenTtlSeconds: Number(env.BACKEND_TOKEN_TTL_SECONDS ?? 300),
     },
     auth: { providerKey: env.AUTH_PROVIDER_KEY, sessionTtlSeconds: Number(env.SESSION_TTL_SECONDS ?? 8 * 60 * 60),
       sessionSecret: env.SESSION_SECRET, transactionSecret: env.AUTH_TRANSACTION_SECRET,

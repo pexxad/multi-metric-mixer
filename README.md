@@ -34,7 +34,7 @@ npm run local:down
 
 ## OpenAI互換APIを後から接続する
 
-モデルAPIが未設定でもアプリとチャット画面は起動します。この状態では、チャット上部に「分析エージェントは接続待ちです」と表示し、疑似的な回答やWorkflowを生成しません。ノードエディタ、Workflow管理、データソース管理、既存Workflowの実行は引き続き利用できます。
+モデルAPIが未設定でもアプリとチャット画面は起動します。チャットを送信すると分析エージェントを現在利用できない旨を返し、疑似的な回答やWorkflowを生成しません。ノードエディタ、Workflow管理、データソース管理、既存Workflowの実行は引き続き利用できます。
 
 `/v1/chat/completions`と`response_format.type=json_schema`に対応するOpenAI互換APIを利用できるようになったら、次の手順で接続します。接続先はLM Studio、社内model gateway、外部のOpenAI互換serviceなどを問いません。
 
@@ -49,6 +49,7 @@ OPENAI_COMPATIBLE_API_KEY=必要な場合だけ設定
 OPENAI_COMPATIBLE_TIMEOUT_MS=60000
 OPENAI_COMPATIBLE_MAX_TOKENS=8192
 OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS=32768
+# OPENAI_COMPATIBLE_REASONING_EFFORT=medium
 ```
 
 3. アプリを再起動します。envファイルの変更は起動中のBFFへ自動反映されません。
@@ -58,7 +59,7 @@ OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS=32768
 npm run local
 ```
 
-チャットに「モデルAPIへ接続できません」と表示された場合は、endpointが起動していること、`OPENAI_COMPATIBLE_BASE_URL`の末尾がAPIのversion path（通常は`/v1`）であること、`OPENAI_COMPATIBLE_MODEL`が`GET /v1/models`に含まれることを確認してください。接続不能、timeout、HTTP error、structured response不正はチャットに原因別で表示され、Node UIや既存Workflowの利用は継続できます。
+チャットに分析エージェントを利用できない旨が表示された場合は、BFF起動時の`agentProvider`と`agentModel`、request errorの`code`を確認してください。そのうえでendpointが起動していること、`OPENAI_COMPATIBLE_BASE_URL`の末尾がAPIのversion path（通常は`/v1`）であること、`OPENAI_COMPATIBLE_MODEL`が`GET /v1/models`に含まれることを確認します。一般利用者向け画面やBrowser APIにはprovider、model、endpoint、transport設定を返しません。
 
 ### macOSからLAN内のモデルAPIへ接続できない場合
 
@@ -75,20 +76,24 @@ BFFは互換APIへserver-sideから接続し、厳格なJSON Schemaで確認質�
 
 ローカルの平文HTTP接続は既定で`localhost`、`127.0.0.1`、`::1`だけを許可します。別端末やmodel gatewayへ接続する場合はHTTPS endpointを使用してください。
 
-HTTPSを用意できないLAN内検証に限り、接続先をRFC1918のリテラルIPv4 addressに固定し、次の明示承認フラグを設定できます。hostnameやpublic IPのHTTPはこのフラグでも許可されません。Workflow、Catalog metadata、将来の結果要約が暗号化されずLANへ流れるため、本番では使用しないでください。
+HTTPSを用意できない環境では、次の明示承認フラグでloopback以外のHTTP endpointへの接続を許可できます。hostname、IPv4、IPv6を区別しないため、LAN内DNSで解決するhostnameも利用できます。Workflow、Catalog metadata、将来の結果要約が暗号化されずネットワークへ流れるため、接続先を運用者が信頼できる場合に限り使用し、本番ではHTTPSへ切り替えてください。
 
 ```dotenv
 OPENAI_COMPATIBLE_BASE_URL=http://192.168.1.252:1234/v1
-OPENAI_COMPATIBLE_ALLOW_INSECURE_PRIVATE_HTTP=true
+OPENAI_COMPATIBLE_ALLOW_INSECURE_HTTP=true
 ```
 
 LM Studioを使う場合もprovider種別は同じです。たとえばLocal Serverを`127.0.0.1:1234`で起動した場合は、`OPENAI_COMPATIBLE_BASE_URL=http://127.0.0.1:1234/v1`を指定します。製品名をアプリ設定へ持ち込まず、互換APIとして扱います。
 
 互換serviceごとにstructured outputの対応範囲やmodel identifierが異なるため、接続後は[release verification](docs/version-1-release-verification.md)に従い、確認質問とWorkflow提案が返ることを検証してください。
 
-reasoning modelがJSONを返す前に出力上限へ達した場合は、画面にモデル出力上限のエラーが表示されます。利用中のserviceとmodelが許容する範囲で`OPENAI_COMPATIBLE_MAX_TOKENS`を増やしてください（アプリ上限は`32768`）。単純な疎通だけでなく、Catalog付きのWorkflow提案が最後まで返ることを確認します。
+reasoning modelがJSONを返す前に出力上限へ達した場合、一般利用者には依頼を分けて再試行するよう表示し、運用者はBFF logの`agent_provider_output_limit`で判別できます。利用中のserviceとmodelが許容する範囲で`OPENAI_COMPATIBLE_MAX_TOKENS`を増やしてください（アプリ上限は`32768`）。単純な疎通だけでなく、Catalog付きのWorkflow提案が最後まで返ることを確認します。
+
+OpenAI互換APIが`finish_reason=stop`と推論用fieldを返していても、最終回答の`message.content`が空なら正常応答ではありません。本アプリは推論用fieldを最終回答として代用せず、応答不正としてfail-closedにします。LM Studio内蔵チャットはOpenAI互換`/v1/chat/completions`と異なる処理経路を使う場合があるため、内蔵チャットの表示だけでなく、実際に設定するendpointへ同じmodel、structured output、tool callを送って`message.content`を確認してください。
 
 `OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS`にはAPI側の入力・出力合計上限を設定します。アプリは最大出力分を先に確保し、残りへ会話、Workflow、Catalogを収めます。長い履歴は古いものから除外し、WorkflowとCatalog自体が収まらない場合はAPIへ送らず明示エラーにします。
+
+`OPENAI_COMPATIBLE_REASONING_EFFORT`は、対応するmodel/APIについて推論量と応答時間のバランスを調整する任意設定です。指定できる値は`none`、`minimal`、`low`、`medium`、`high`、`xhigh`です。未設定なら`reasoning_effort`をAPIへ送らず、接続先の既定値を使います。対応値はmodelごとに異なるため、接続先が明示的に対応する値だけを指定してください。この設定は推論用fieldを最終回答へ転用するものではなく、アプリは引き続き`message.content`だけを最終回答として扱います。
 
 ## 外部OIDC Providerで開発する
 
@@ -137,24 +142,25 @@ OIDC Providerには`http://localhost:5173/auth/callback`をcallback URL、`http:
 
 BFFの稼働確認は`/health`、Backend到達性を含む準備完了確認は`/ready`です。Backendは`/mcp`と`/internal/api`を同じloopback listenerで提供します。Data source接続の登録・変更・test・archiveはInternal APIだけにあり、MCP toolとして公開されません。
 
-localの永続化も共有DBではありません。BFFのidentity/session/Conversationは`.data/bff-v1.sqlite`、BackendのData source/Catalog/Workflow/Run/Artifact metadataは`.data/backend-v1.sqlite`へ保存されます。BFFはBackend DBを直接参照せず、起動時に生成されるEd25519署名付き短期CapabilityでBackendを呼び出します。productionでは同じkeyを固定管理し、BFFへprivate key、Backendへpublic keyだけを配置します。
+通常の分析画面へ渡すData source情報は、名前、形式、version、安全な検索パターン入力などのcapabilityに限定されます。URL、table、collection、log groupなどの編集用定義は管理者が「データソース管理」を開いたときだけ取得し、DB/MongoDBの接続URI、driver、TLS、denylistは管理画面にも返しません。画面からの保存・接続test・手動Catalog探索・Workflow実行はInternal API、Agentが会話中に選ぶ探索・sample・分析操作はMCPを使います。
+
+localの永続化も共有DBではありません。BFFのidentity/session/Conversationは`.data/bff-v1.sqlite`、BackendのData source/Catalog/Workflow/Run/Artifact metadataは`.data/backend-v1.sqlite`へ保存されます。BFFはBackend DBを直接参照せず、Ed25519署名付き短期Bearer access tokenでBackendを呼び出します。同じtokenは期限内の複数requestで利用でき、`BACKEND_TOKEN_TTL_SECONDS`は既定300秒、local評価では3600秒です。productionでは許容するsession・membership失効反映時間に合わせて短く設定し、BFFへprivate key、Backendへpublic keyだけを配置します。
 
 ## ローカルのデータソースを試す
 
-`npm run local`でPostgreSQLとMongoDBも起動し、読み取り専用ユーザーとサンプルデータを自動作成します。接続文字列は[`local/source-secrets.json`](local/source-secrets.json)から`.data/local-source-secrets.json`へコピーされるため、管理画面へホスト名、ユーザー名、パスワードを入力する必要はありません。管理画面では対応するSecret IDと、公開してよいテーブルまたはコレクションだけを登録します。
+`npm run local`でPostgreSQLとMongoDBも起動し、読み取り専用ユーザーとサンプルデータを自動作成します。[`local/connection-profiles.json`](local/connection-profiles.json)にサーバー側の接続URIを直接定義し、起動時に所有者だけが読める`.data/local-connection-profiles.json`へコピーします。ブラウザへURI、driver、credential、denylistは返しません。管理画面には「表形式DB A」「JSONライクDB C」のような論理名だけを表示し、管理者は接続先とテーブルまたはコレクションを登録します。
 
 ### PostgreSQLを登録する
 
 1. [http://localhost:5173](http://localhost:5173)を開き、管理者の`admin@example.com` / `local-password`でログインします。
-2. 左側の「データソース管理」を開き、「SQL」を選択します。
+2. 左側の「データソース管理」を開き、「表形式DB」を選択します。
 3. 次の値を入力して「接続を登録」を押します。
 
 | 項目 | 入力値 |
 | --- | --- |
 | 接続ID | `local-sales` |
 | 表示名 | `Local Sales` |
-| Driver | `PostgreSQL` |
-| Secret ID | `local/postgres` |
+| 接続先 | `表形式DB A` |
 | Schema | `public` |
 | Table | `sales` |
 | 最大行数 | `1000` |
@@ -163,14 +169,14 @@ localの永続化も共有DBではありません。BFFのidentity/session/Conve
 
 ### MongoDBを登録する
 
-1. 同じ「データソース管理」で「MongoDB」を選択します。
+1. 同じ「データソース管理」で「JSONライクDB」を選択します。
 2. 次の値を入力して「接続を登録」を押します。
 
 | 項目 | 入力値 |
 | --- | --- |
 | 接続ID | `local-events` |
 | 表示名 | `Local Events` |
-| Secret ID | `local/mongodb` |
+| 接続先 | `JSONライクDB C` |
 | Database | `metrics` |
 | Collection | `events` |
 | 最大document数 | `1000` |
@@ -179,13 +185,13 @@ localの永続化も共有DBではありません。BFFのidentity/session/Conve
 
 ### 複数データソースの結合を試す
 
-同じMongoDB設定で、次の安定した地域マスタも登録できます。
+同じJSONライクDB接続で、次の安定した地域マスタも登録できます。
 
 | 項目 | 入力値 |
 | --- | --- |
 | 接続ID | `local-regions` |
 | 表示名 | `Local Regions` |
-| Secret ID | `local/mongodb` |
+| 接続先 | `JSONライクDB C` |
 | Database | `metrics` |
 | Collection | `regions` |
 | 最大document数 | `1000` |
@@ -196,7 +202,7 @@ localの永続化も共有DBではありません。BFFのidentity/session/Conve
 
 データ取得ノードを追加または選択して、接続先に`Local Sales`か`Local Events`を指定します。絞り込み・列選択、計算列、データ結合、集計、複数データ集計、並べ替え・件数ノードでは、有効なCatalog（自分用があれば自分用、なければWorkspace正本）からfield候補が表示されます。その後にプレビューノードやCSV出力ノードへ接続し、右上の「実行」から結果を確認できます。一般ユーザーは接続設定を変更できませんが、管理者が登録した接続をWorkflowで利用できます。
 
-ローカルDBはホスト側の`127.0.0.1:5433`（PostgreSQL）と`127.0.0.1:27017`（MongoDB）だけに公開され、アプリからは読み取り専用の`mmm_reader`を使用します。接続できない場合はDocker Desktopが起動していることを確認し、次のコマンドでコンテナと初期データを作り直してください。
+ローカルDBはホスト側の`127.0.0.1:5433`（PostgreSQL）と`127.0.0.1:27017`（MongoDB）だけに公開され、アプリからは読み取り専用の`mmm_reader`を使用します。接続プロファイルの`deniedDatasets`は`schema.table`または`database.collection`を完全一致か`namespace.*`で拒否する補助防御です。最終的な安全境界はDB側の読み取り専用credentialと権限です。接続できない場合はDocker Desktopが起動していることを確認し、次のコマンドでコンテナと初期データを作り直してください。
 
 ```bash
 npm run local:down
@@ -206,6 +212,12 @@ npm run local
 Cognitoでは`cognito:groups`、ローカルKeycloakでは`groups` claimを読み、`OIDC_ADMIN_GROUP`と完全一致するgroupを持つユーザーだけを管理者とします。画面だけでなく、登録・編集・接続テスト・アーカイブ・JSON／CSV登録APIも同じ権限で拒否します。
 
 JSON／CSVは接続登録画面からファイルをアップロードします。
+
+### 大規模データソースの検索パターン
+
+CloudWatch Logsは「取得方式」を「検索パターン必須」にすると、無条件の先頭N件取得を禁止できます。管理者はデータソース管理で複数のLogs Insightsパターンを追加し、開始日時、終了日時、自由入力、数値、プルダウンの変数と必須条件を設定します。query内では追加変数を`{{variableId}}`で参照します。
+
+一般利用者とAgentにはquery本文を表示せず、ノード設定には管理者が定義した入力欄だけを表示します。WorkflowにはData source version、パターンID、入力値だけを保存します。プルダウン外の値、未知の変数、最大検索期間を超える入力はBackendで拒否されます。
 
 REST APIの独立サンプルは必要な場合だけ別terminalで起動します。
 

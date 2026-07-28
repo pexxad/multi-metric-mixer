@@ -1,14 +1,15 @@
 import { Hono } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
-import type { BackendCore } from '../backend-core/runtime'
 import type { BackendRuntimeConfig } from './config'
-import { BackendCapabilityVerifier } from '../shared/backend-capability'
+import type { BackendServerServices } from './runtime'
+import { BackendAccessTokenVerifier } from '../shared/backend-access-token'
 import { createMcpRequestHandler } from './mcp-adapter'
 import { createBackendApiAdapter } from './api-adapter'
 
-export function createBackendApp(config: BackendRuntimeConfig, core: BackendCore) {
+export function createBackendApp(config: BackendRuntimeConfig, services: BackendServerServices) {
+  const { core } = services
   const expectedHost = `${config.backendServer.hostname}:${config.backendServer.port}`
-  const verifier = new BackendCapabilityVerifier({
+  const verifier = new BackendAccessTokenVerifier({
     issuer: config.backendServer.tokenIssuer,
     audience: config.backendServer.audience,
     keyId: config.backendServer.tokenKeyId,
@@ -28,6 +29,7 @@ export function createBackendApp(config: BackendRuntimeConfig, core: BackendCore
       workflowExecution: core.execution,
       workflows: core.workflows,
       catalogs: core.catalogs,
+      exploration: core.exploration,
     },
   })
   app.use('/mcp', bodyLimit({
@@ -40,6 +42,7 @@ export function createBackendApp(config: BackendRuntimeConfig, core: BackendCore
     expectedOrigin: config.backendServer.origin,
     verifier,
     core,
+    connectionProfiles: services.connectionProfiles,
   }))
   app.get('/health', (c) => c.req.header('Host') === expectedHost && c.req.header('Origin') === config.backendServer.origin
     ? c.json({ status: 'ok', service: 'multi-metric-mixer-backend', release: config.release })

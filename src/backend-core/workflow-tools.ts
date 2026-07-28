@@ -1,14 +1,49 @@
 import { AppError } from '../shared/errors'
 import type { RequestContext } from '../shared/request-context'
 import type { ArtifactRepository, StoredArtifact } from './persistence/artifact-repository'
-import type { AggregateStep, CsvStep, DeriveStep, FilterSelectStep, JoinAggregateStep, JoinStep, JsonValue,
-  PreviewStep, SortLimitStep, TableRow } from '../shared/workflow'
+import { aggregateOutputColumn, type AggregateStep, type CsvStep, type DeriveStep, type FilterSelectStep, type JoinAggregateStep, type JoinStep, type JsonValue,
+  ParseDocumentsStep, PreviewStep, SortLimitStep, TableRow } from '../shared/workflow'
 
 export class WorkflowTools {
   constructor(private readonly artifacts: ArtifactRepository, private readonly maxJoinRows = 100_000) {}
 
   summary(artifact: StoredArtifact) {
     return this.artifacts.summary(artifact)
+  }
+
+  async parseDocuments(context: RequestContext, artifactId: string, config: ParseDocumentsStep['config'], runId?: string): Promise<StoredArtifact> {
+    const input = await this.artifacts.requireDocuments(context, artifactId)
+    const records = selectRecords(input.documents, config.recordPath)
+    const rows: TableRow[] = []
+    for (const record of records) {
+      const row: TableRow = {}
+      let skip = false
+      for (const column of config.columns) {
+        const value = readDocumentPath(record, column.path)
+        if (value === MISSING) {
+          if (config.onMissing === 'error') throw new AppError('document_field_missing', 400, `JSONパス「${column.path}」がありません。`)
+          if (config.onMissing === 'skip') { skip = true; break }
+          row[column.name] = null
+          continue
+        }
+        const converted = convertDocumentValue(value, column.dataType)
+        if (converted === MISMATCH) {
+          if (config.onTypeMismatch === 'error') {
+            throw new AppError('document_type_mismatch', 400, `JSONパス「${column.path}」を${column.dataType}へ変換できません。`)
+          }
+          if (config.onTypeMismatch === 'skip') { skip = true; break }
+          row[column.name] = null
+        } else row[column.name] = converted
+      }
+      if (!skip) rows.push(row)
+    }
+    return this.artifacts.createTable(context, `${input.name}-parsed`, rows, [
+      ...input.provenance,
+      `parse:record=${config.recordPath}`,
+      `parse:columns=${config.columns.map((column) => `${column.name}<-${column.path}:${column.dataType}`).join(',')}`,
+      `parse:onMissing=${config.onMissing}`,
+      `parse:onTypeMismatch=${config.onTypeMismatch}`,
+    ], { runId, classification: input.classification })
   }
 
   async filterSelect(context: RequestContext, artifactId: string, config: FilterSelectStep['config'], runId?: string): Promise<StoredArtifact> {
@@ -70,21 +105,24 @@ export class WorkflowTools {
   async aggregate(context: RequestContext, artifactId: string, config: AggregateStep['config'], runId?: string): Promise<StoredArtifact> {
     const input = await this.artifacts.requireTable(context, artifactId)
     const buckets = new Map<string, AggregateBucket>()
+    if (!config.groupBy) buckets.set('all', emptyAggregateBucket(null))
     for (const row of input.rows) {
-      const label = readField(row, config.groupBy)
-      const metricValue = readField(row, config.metric)
-      const key = joinKey(label)
+      const label = config.groupBy ? readField(row, config.groupBy) : null
+      const metricValue = config.metric ? readField(row, config.metric) : null
+      const key = config.groupBy ? joinKey(label) : 'all'
       const current = buckets.get(key) ?? emptyAggregateBucket(label)
-      if (config.operation !== 'count') addMetric(current, metricValue, config.metric)
+      if (config.operation !== 'count') addMetric(current, metricValue, config.metric!)
       current.count += 1
       buckets.set(key, current)
     }
-    const rows = [...buckets.values()].sort((a, b) => String(a.label).localeCompare(String(b.label), 'ja')).map((bucket) => ({
-      [config.groupBy]: bucket.label,
-      [`${config.operation}_${config.metric}`]: aggregateBucketValue(config.operation, bucket),
-    }))
-    return this.artifacts.createTable(context, `${config.groupBy}-${config.operation}-${config.metric}`, rows,
-      [...input.provenance, `aggregate:${config.groupBy}/${config.operation}/${config.metric}`], { runId, classification: input.classification })
+    const outputColumn = aggregateOutputColumn(config)
+    const rows = [...buckets.values()].sort((a, b) => String(a.label).localeCompare(String(b.label), 'ja')).map((bucket) =>
+      config.groupBy
+        ? { [config.groupBy]: bucket.label, [outputColumn]: aggregateBucketValue(config.operation, bucket) }
+        : { [outputColumn]: aggregateBucketValue(config.operation, bucket) })
+    const grouping = config.groupBy ?? 'all'
+    return this.artifacts.createTable(context, `${grouping}-${outputColumn}`, rows,
+      [...input.provenance, `aggregate:${grouping}/${config.operation}/${config.metric ?? 'rows'}`], { runId, classification: input.classification })
   }
 
   async joinAggregate(
@@ -132,7 +170,19 @@ export class WorkflowTools {
   }
 
   async preview(context: RequestContext, artifactId: string, config: PreviewStep['config'], runId?: string): Promise<StoredArtifact> {
-    const input = await this.artifacts.requireTable(context, artifactId)
+    const input = await this.artifacts.get(context, artifactId)
+    if (!input) throw new AppError('artifact_not_found', 404, `成果物「${artifactId}」が見つかりません。`)
+    if (input.type === 'documents') {
+      const documents = input.documents ?? []
+      const preview = documents.length === 1 && Array.isArray(documents[0])
+        ? documents[0].slice(0, config.limit)
+        : documents.slice(0, config.limit)
+      return this.artifacts.createDocuments(context, `${input.name}-preview`, preview,
+        [...input.provenance, `preview:limit=${config.limit}`], { runId, classification: input.classification })
+    }
+    if (input.type !== 'table' || !input.rows) {
+      throw new AppError('artifact_type_mismatch', 400, 'CSV成果物はプレビュー処理へ入力できません。')
+    }
     return this.artifacts.createTable(context, `${input.name}-preview`, input.rows.slice(0, config.limit),
       [...input.provenance, `preview:limit=${config.limit}`], { runId, classification: input.classification })
   }
@@ -142,6 +192,54 @@ export class WorkflowTools {
     return this.artifacts.createCsv(context, config.fileName, input.rows,
       [...input.provenance, `export:csv/${config.fileName}`], config.mode, { runId, classification: input.classification })
   }
+}
+
+const MISSING = Symbol('missing')
+const MISMATCH = Symbol('mismatch')
+
+function pathParts(path: string): string[] {
+  const base = path.endsWith('[]') ? path.slice(0, -2) : path
+  return base === '$' ? [] : base.slice(2).split('.')
+}
+
+function readDocumentPath(value: JsonValue, path: string): JsonValue | typeof MISSING {
+  let current = value
+  for (const part of pathParts(path)) {
+    if (current === null || Array.isArray(current) || typeof current !== 'object' || !(part in current)) return MISSING
+    current = current[part]!
+  }
+  return current
+}
+
+function selectRecords(documents: JsonValue[], recordPath: string): JsonValue[] {
+  const explode = recordPath.endsWith('[]')
+  const records: JsonValue[] = []
+  for (const document of documents) {
+    const selected = readDocumentPath(document, explode ? recordPath.slice(0, -2) : recordPath)
+    if (selected === MISSING) continue
+    if (explode) {
+      if (!Array.isArray(selected)) throw new AppError('document_record_path_invalid', 400, `レコードパス「${recordPath}」は配列ではありません。`)
+      records.push(...selected)
+    } else records.push(selected)
+  }
+  return records
+}
+
+function convertDocumentValue(value: JsonValue, type: ParseDocumentsStep['config']['columns'][number]['dataType']): JsonValue | typeof MISMATCH {
+  if (value === null || typeof value === 'object') return MISMATCH
+  if (type === 'string') return typeof value === 'string' ? value : String(value)
+  if (type === 'number') {
+    const parsed = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : Number.NaN
+    return Number.isFinite(parsed) ? parsed : MISMATCH
+  }
+  if (type === 'boolean') {
+    if (typeof value === 'boolean') return value
+    if (value === 'true' || value === 'false') return value === 'true'
+    return MISMATCH
+  }
+  if (typeof value !== 'string' && typeof value !== 'number') return MISMATCH
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? MISMATCH : date.toISOString()
 }
 
 function joinKey(value: TableRow[string]): string {

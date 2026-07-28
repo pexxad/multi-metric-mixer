@@ -1,39 +1,21 @@
-import type { AgentProviderStatus, AgentResponse } from '../shared/api'
+import type { AgentResponse, AgentToolActivity } from '../shared/api'
 import type { Workflow, WorkflowRun } from '../shared/workflow'
 import type { CatalogBundle, CatalogDefinition, CatalogVersion } from '../shared/catalog'
+import type { DataSource as StoredDataSource, DataSourceCapability, DataSourceRegistration } from '../shared/data-source'
 
 export type AuthProvider = { key: string; label: string }
 export type AuthSession = {
   authenticated: true
-  principal: { id: string; displayName: string; email?: string; status: 'active' }
-  workspace: { id: string; name: string; slug: string; role: 'owner' | 'editor' | 'runner' | 'viewer'; membershipVersion: number }
+  principal: { displayName: string }
+  workspace: { name: string; role: 'owner' | 'editor' | 'runner' | 'viewer' }
   applicationRole: 'admin' | 'user'
-  assuranceLevel: 'basic' | 'mfa' | 'strong'
   csrfToken: string
 }
 
-type DataSourceBase = { id: string; name: string; version: number; accessMode: 'read-only'; status: 'active' }
-type RestDataSource = DataSourceBase & {
-  id: string
-  name: string
-  type: 'rest-json'
-  baseUrl: string
-  path: string
-  method: 'GET'
-}
-type DynamoDataSource = DataSourceBase & { type: 'dynamodb'; region: string; tableName: string; partitionKey: string; sortKey?: string; maxItems: number }
-type CloudWatchLogsDataSource = DataSourceBase & { type: 'cloudwatch-logs'; region: string; logGroupName: string; maxResults: number; maxRangeSeconds: number }
-type UploadArtifactDataSource = DataSourceBase & { type: 'upload-artifact'; artifactId: string; format: 'json' | 'csv' }
-type SqlDataSource = DataSourceBase & { type: 'sql'; driver: 'postgresql' | 'sqlite'; secretId: string; schema?: string; table: string; maxRows: number }
-type MongoDataSource = DataSourceBase & { type: 'mongodb'; secretId: string; database: string; collection: string; maxDocuments: number }
-export type DataSource = RestDataSource | DynamoDataSource | CloudWatchLogsDataSource | UploadArtifactDataSource | SqlDataSource | MongoDataSource
-type DataSourceRegistration =
-  | Omit<RestDataSource, 'version' | 'accessMode' | 'status'>
-  | Omit<DynamoDataSource, 'version' | 'accessMode' | 'status'>
-  | Omit<CloudWatchLogsDataSource, 'version' | 'accessMode' | 'status'>
-  | Omit<UploadArtifactDataSource, 'version' | 'accessMode' | 'status'>
-  | Omit<SqlDataSource, 'version' | 'accessMode' | 'status'>
-  | Omit<MongoDataSource, 'version' | 'accessMode' | 'status'>
+export type DataSource = DataSourceCapability
+export type AdminDataSource = StoredDataSource
+
+export type ConnectionProfile = { id: string; displayName: string; dataModel: 'table' | 'documents' }
 
 export type SavedWorkflow = {
   workflow: Workflow
@@ -52,23 +34,34 @@ export type Bootstrap = {
   dataSources: DataSource[]
   catalogs: CatalogVersion[]
   conversations: Array<{ id: string; title: string; workflowId: string | null; updatedAt: string }>
-  principal: AuthSession['principal']
-  workspace: AuthSession['workspace']
-  applicationRole: AuthSession['applicationRole']
-  mcp: { transport: string; tools: number; dataSourceAccess: 'read-only' }
-  agent: AgentProviderStatus
 }
 export type RunRecord = { id: string; workflowId: string; workflowVersion: number; status: string; startedAt: string; finishedAt?: string; summary: unknown }
 
 type Problem = { title?: string; detail?: string; code?: string; errors?: unknown }
 
+function problemMessage(problem: Problem, fallback: string): string {
+  const summary = problem.detail ?? problem.title ?? problem.code ?? fallback
+  const details = Array.isArray(problem.errors)
+    ? problem.errors.filter((error): error is string => typeof error === 'string')
+    : []
+  return details.length > 0 ? `${summary}\n${details.map((detail) => `・${detail}`).join('\n')}` : summary
+}
+
 async function parse<T>(response: Response): Promise<T> {
   const body = await response.json().catch(() => undefined) as T | Problem | undefined
   if (!response.ok) {
     const problem = body as Problem | undefined
-    throw new Error(problem?.detail ?? problem?.title ?? problem?.code ?? `HTTP ${response.status}`)
+    throw new Error(problem ? problemMessage(problem, `HTTP ${response.status}`) : `HTTP ${response.status}`)
   }
   return body as T
+}
+
+function request<T>(url: string, init?: RequestInit): Promise<T> {
+  return fetch(url, init).then((response) => parse<T>(response))
+}
+
+function mutate<T>(session: AuthSession, url: string, method: 'POST' | 'PATCH' | 'DELETE', body: unknown = {}): Promise<T> {
+  return request<T>(url, { method, headers: mutationHeaders(session), body: JSON.stringify(body) })
 }
 
 export async function loadAuth(): Promise<{ session: AuthSession | null; providers: AuthProvider[] }> {
@@ -83,19 +76,21 @@ export function loadInitialAuth(): ReturnType<typeof loadAuth> {
   return pendingInitialAuth
 }
 
-export const loadBootstrap = () => fetch('/api/bootstrap').then((response) => parse<Bootstrap>(response))
+export const loadBootstrap = () => request<Bootstrap>('/api/bootstrap')
+export const loadConnectionProfiles = () => request<{ connections: ConnectionProfile[] }>('/api/connection-profiles')
+export const loadAdminDataSources = () => request<{ sources: AdminDataSource[] }>('/api/data-sources')
 
-export function loadRuns(_session: AuthSession) {
-  return fetch('/api/runs').then((response) => parse<{ runs: RunRecord[] }>(response))
+export function loadRuns() {
+  return request<{ runs: RunRecord[] }>('/api/runs')
 }
 
-export function loadArtifacts(_session: AuthSession) {
-  return fetch('/api/artifacts').then((response) => parse<{ artifacts: import('../shared/workflow').ArtifactSummary[] }>(response))
+export function loadArtifacts() {
+  return request<{ artifacts: import('../shared/workflow').ArtifactSummary[] }>('/api/artifacts')
 }
 
 export function requestArtifactDownload(session: AuthSession, artifactId: string) {
-  return fetch(`/api/artifacts/${encodeURIComponent(artifactId)}/download-approvals`, { method: 'POST', headers: mutationHeaders(session), body: '{}' })
-    .then((response) => parse<{ id: string; expiresAt: string; summary: Record<string, unknown> }>(response))
+  return mutate<{ id: string; expiresAt: string; summary: Record<string, unknown> }>(
+    session, `/api/artifacts/${encodeURIComponent(artifactId)}/download-approvals`, 'POST')
 }
 
 export async function downloadArtifact(session: AuthSession, artifactId: string, approvalId: string): Promise<Blob> {
@@ -105,33 +100,30 @@ export async function downloadArtifact(session: AuthSession, artifactId: string,
   return response.blob()
 }
 
-export const loadWorkflowVersions = (id: string) => fetch(`/api/workflows/${encodeURIComponent(id)}/versions`)
-  .then((response) => parse<{ versions: SavedWorkflow[] }>(response))
+export const loadWorkflowVersions = (id: string) =>
+  request<{ versions: SavedWorkflow[] }>(`/api/workflows/${encodeURIComponent(id)}/versions`)
 
 function mutationHeaders(session: AuthSession): Record<string, string> {
   return { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrfToken }
 }
 
 export function saveWorkflow(session: AuthSession, workflow: Workflow, changeSource: 'manual' | 'agent' | 'import' = 'manual', expectedVersion?: number) {
-  return fetch('/api/workflows', { method: 'POST', headers: mutationHeaders(session), body: JSON.stringify({ workflow, changeSource, expectedVersion }) })
-    .then((response) => parse<SavedWorkflow>(response))
+  return mutate<SavedWorkflow>(session, '/api/workflows', 'POST', { workflow, changeSource, expectedVersion })
 }
 
 export function archiveWorkflow(session: AuthSession, id: string, expectedVersion: number) {
-  return fetch(`/api/workflows/${encodeURIComponent(id)}`, { method: 'DELETE', headers: mutationHeaders(session),
-    body: JSON.stringify({ expectedVersion }) }).then((response) => parse<{ archived: true }>(response))
+  return mutate<{ archived: true }>(session, `/api/workflows/${encodeURIComponent(id)}`, 'DELETE', { expectedVersion })
 }
 
 export function requestWorkflowRunApproval(session: AuthSession, workflowId: string, version: number) {
-  return fetch(`/api/workflows/${encodeURIComponent(workflowId)}/run-approvals`, {
-    method: 'POST', headers: mutationHeaders(session), body: JSON.stringify({ version }),
-  }).then((response) => parse<{ id: string; expiresAt: string; summary: Record<string, unknown> }>(response))
+  return mutate<{ id: string; expiresAt: string; summary: Record<string, unknown> }>(
+    session, `/api/workflows/${encodeURIComponent(workflowId)}/run-approvals`, 'POST', { version })
 }
 
-export function executeWorkflow(session: AuthSession, workflowId: string, version: number, approvalId?: string) {
-  return fetch(`/api/workflows/${encodeURIComponent(workflowId)}/runs`, {
-    method: 'POST', headers: mutationHeaders(session), body: JSON.stringify({ version, approvalId }),
-  }).then((response) => parse<{ run: WorkflowRun }>(response))
+export function executeWorkflow(session: AuthSession, workflowId: string, version: number, approvalId?: string,
+  conversationId?: string) {
+  return mutate<{ run: WorkflowRun }>(
+    session, `/api/workflows/${encodeURIComponent(workflowId)}/runs`, 'POST', { version, approvalId, conversationId })
 }
 
 export function respondToAgent(session: AuthSession, input: {
@@ -139,118 +131,130 @@ export function respondToAgent(session: AuthSession, input: {
   workflow: Workflow
   conversationId?: string
   clientMessageId: string
-}) {
-  return fetch('/api/agent/respond', {
-    method: 'POST', headers: mutationHeaders(session), body: JSON.stringify(input),
-  }).then((response) => parse<AgentResponse>(response))
+}, onActivity?: (activity: AgentToolActivity) => void): Promise<AgentResponse> {
+  if (!onActivity) return mutate<AgentResponse>(session, '/api/agent/respond', 'POST', input)
+  return fetch('/api/agent/respond/stream', {
+    method: 'POST',
+    headers: { ...mutationHeaders(session), Accept: 'text/event-stream' },
+    body: JSON.stringify(input),
+  }).then(async (response) => {
+    if (!response.ok || !response.body) return parse<AgentResponse>(response)
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let result: AgentResponse | undefined
+    for (;;) {
+      const chunk = await reader.read()
+      buffer += decoder.decode(chunk.value, { stream: !chunk.done })
+      buffer = buffer.replaceAll('\r\n', '\n')
+      if (chunk.done && buffer.trim()) buffer += '\n\n'
+      const events = buffer.split('\n\n')
+      buffer = events.pop() ?? ''
+      for (const event of events) {
+        const eventName = event.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim()
+        const data = event.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
+        if (!data) continue
+        const value = JSON.parse(data) as AgentToolActivity | AgentResponse | Problem
+        if (eventName === 'activity') onActivity(value as AgentToolActivity)
+        else if (eventName === 'response') result = value as AgentResponse
+        else if (eventName === 'error') {
+          const problem = value as Problem
+          throw new Error(problemMessage(problem, '分析エージェントの処理に失敗しました。'))
+        }
+      }
+      if (chunk.done) break
+    }
+    if (!result) throw new Error('分析エージェントの応答が完了しませんでした。')
+    return result
+  })
 }
 
 export function registerSource(session: AuthSession, source: DataSourceRegistration) {
-  return fetch('/api/data-sources', { method: 'POST', headers: mutationHeaders(session), body: JSON.stringify(source) })
-    .then((response) => parse<{ source: DataSource }>(response))
+  return mutate<{ source: AdminDataSource; capability: DataSource }>(session, '/api/data-sources', 'POST', source)
 }
 
 export function archiveSource(session: AuthSession, id: string) {
-  return fetch(`/api/data-sources/${encodeURIComponent(id)}`, { method: 'DELETE', headers: mutationHeaders(session) })
-    .then((response) => parse<{ archived: true }>(response))
+  return mutate<{ archived: true }>(session, `/api/data-sources/${encodeURIComponent(id)}`, 'DELETE')
 }
 
-export function updateSource(session: AuthSession, source: DataSource, expectedVersion: number) {
+export function updateSource(session: AuthSession, source: AdminDataSource, expectedVersion: number) {
   const { version: _version, accessMode: _accessMode, status: _status, ...definition } = source
-  return fetch(`/api/data-sources/${encodeURIComponent(source.id)}`, { method: 'PATCH', headers: mutationHeaders(session),
-    body: JSON.stringify({ source: definition, expectedVersion }) }).then((response) => parse<{ source: DataSource }>(response))
+  return mutate<{ source: AdminDataSource; capability: DataSource }>(
+    session, `/api/data-sources/${encodeURIComponent(source.id)}`, 'PATCH', { source: definition, expectedVersion })
 }
-export function sourceImpact(session: AuthSession, id: string) {
-  void session
-  return fetch(`/api/data-sources/${encodeURIComponent(id)}/impact`)
-    .then((response) => parse<{ workflows: Array<{ workflowId: string; workflowName: string; version: number }> }>(response))
+export function sourceImpact(id: string) {
+  return request<{ workflows: Array<{ workflowId: string; workflowName: string; version: number }> }>(
+    `/api/data-sources/${encodeURIComponent(id)}/impact`)
 }
-export function testSource(session: AuthSession, id: string, parameters: Record<string, string> = {}) {
-  return fetch(`/api/data-sources/${encodeURIComponent(id)}/test`, { method: 'POST', headers: mutationHeaders(session),
-    body: JSON.stringify({ parameters }) }).then((response) => parse<{ artifact: import('../shared/workflow').ArtifactSummary }>(response))
-}
-
-export function loadCatalogBundle(_session: AuthSession, sourceId: string) {
-  return fetch(`/api/catalog/${encodeURIComponent(sourceId)}`).then((response) => parse<CatalogBundle>(response))
+export function testSource(session: AuthSession, id: string) {
+  return mutate<{ artifact: import('../shared/workflow').ArtifactSummary }>(
+    session, `/api/data-sources/${encodeURIComponent(id)}/test`, 'POST')
 }
 
-export function loadCatalogs(_session: AuthSession) {
-  return fetch('/api/catalog').then((response) => parse<{ catalogs: CatalogVersion[] }>(response))
+export function loadCatalogBundle(sourceId: string) {
+  return request<CatalogBundle>(`/api/catalog/${encodeURIComponent(sourceId)}`)
+}
+
+export function loadCatalogs() {
+  return request<{ catalogs: CatalogVersion[] }>('/api/catalog')
 }
 
 export function savePersonalCatalog(session: AuthSession, sourceId: string, definition: CatalogDefinition, expectedVersion?: number) {
-  return fetch(`/api/catalog/${encodeURIComponent(sourceId)}/personal`, { method: 'POST', headers: mutationHeaders(session),
-    body: JSON.stringify({ definition, expectedVersion }) }).then((response) => parse<{ catalog: CatalogVersion }>(response))
+  return mutate<{ catalog: CatalogVersion }>(
+    session, `/api/catalog/${encodeURIComponent(sourceId)}/personal`, 'POST', { definition, expectedVersion })
 }
 
 export function resetPersonalCatalog(session: AuthSession, sourceId: string) {
-  return fetch(`/api/catalog/${encodeURIComponent(sourceId)}/personal`, { method: 'DELETE', headers: mutationHeaders(session) })
-    .then((response) => parse<CatalogBundle>(response))
+  return mutate<CatalogBundle>(session, `/api/catalog/${encodeURIComponent(sourceId)}/personal`, 'DELETE')
 }
 
 export function saveCanonicalCatalog(session: AuthSession, sourceId: string, definition: CatalogDefinition, expectedVersion?: number) {
-  return fetch(`/api/catalog/${encodeURIComponent(sourceId)}/canonical`, { method: 'POST', headers: mutationHeaders(session),
-    body: JSON.stringify({ definition, expectedVersion }) }).then((response) => parse<{ catalog: CatalogVersion }>(response))
+  return mutate<{ catalog: CatalogVersion }>(
+    session, `/api/catalog/${encodeURIComponent(sourceId)}/canonical`, 'POST', { definition, expectedVersion })
 }
 
 export function promotePersonalCatalog(session: AuthSession, sourceId: string, expectedCanonicalVersion?: number) {
-  return fetch(`/api/catalog/${encodeURIComponent(sourceId)}/promote`, { method: 'POST', headers: mutationHeaders(session),
-    body: JSON.stringify({ expectedCanonicalVersion }) }).then((response) => parse<{ catalog: CatalogVersion }>(response))
+  return mutate<{ catalog: CatalogVersion }>(
+    session, `/api/catalog/${encodeURIComponent(sourceId)}/promote`, 'POST', { expectedCanonicalVersion })
 }
 
 export function exploreCatalog(session: AuthSession, sourceId: string) {
-  return fetch(`/api/catalog/${encodeURIComponent(sourceId)}/explore`, { method: 'POST', headers: mutationHeaders(session), body: '{}' })
-    .then((response) => parse<{ catalog: CatalogVersion }>(response))
+  return mutate<{ catalog: CatalogVersion }>(session, `/api/catalog/${encodeURIComponent(sourceId)}/explore`, 'POST')
 }
 export function confirmArchiveSource(session: AuthSession, id: string) {
-  return fetch(`/api/data-sources/${encodeURIComponent(id)}?confirm=true`, { method: 'DELETE', headers: mutationHeaders(session) })
-    .then((response) => parse<{ archived: true }>(response))
+  return mutate<{ archived: true }>(session, `/api/data-sources/${encodeURIComponent(id)}?confirm=true`, 'DELETE')
 }
 
 export function loadConversation(id: string) {
-  return fetch(`/api/conversations/${encodeURIComponent(id)}`).then((response) => parse<{ id: string; title: string; messages: Array<{
-    id: string; role: 'user' | 'assistant' | 'system'; content: string; metadata?: unknown; workflowId: string | null; workflowVersion: number | null }> }>(response))
+  return request<{ id: string; title: string; messages: Array<{
+    id: string; role: 'user' | 'assistant' | 'system'; content: string; metadata?: unknown; workflowId: string | null; workflowVersion: number | null
+  }> }>(`/api/conversations/${encodeURIComponent(id)}`)
 }
 
 export function linkConversationWorkflow(session: AuthSession, conversationId: string, workflowId: string, workflowVersion: number) {
-  return fetch(`/api/conversations/${encodeURIComponent(conversationId)}/workflow-link`, { method: 'POST', headers: mutationHeaders(session),
-    body: JSON.stringify({ workflowId, workflowVersion }) }).then((response) => parse<{ id: string; workflowId: string }>(response))
+  return mutate<{ id: string; workflowId: string }>(
+    session, `/api/conversations/${encodeURIComponent(conversationId)}/workflow-link`, 'POST', { workflowId, workflowVersion })
 }
 
 export function requestWorkflowExport(session: AuthSession, id: string, version: number) {
-  return fetch(`/api/workflows/${encodeURIComponent(id)}/export-approvals`, { method: 'POST', headers: mutationHeaders(session),
-    body: JSON.stringify({ version }) }).then((response) => parse<{ id: string; expiresAt: string; summary: Record<string, unknown> }>(response))
+  return mutate<{ id: string; expiresAt: string; summary: Record<string, unknown> }>(
+    session, `/api/workflows/${encodeURIComponent(id)}/export-approvals`, 'POST', { version })
 }
 export function exportWorkflow(session: AuthSession, id: string, version: number, approvalId: string) {
-  return fetch(`/api/workflows/${encodeURIComponent(id)}/export`, { method: 'POST', headers: mutationHeaders(session),
-    body: JSON.stringify({ version, approvalId }) }).then((response) => parse<Record<string, unknown>>(response))
+  return mutate<Record<string, unknown>>(
+    session, `/api/workflows/${encodeURIComponent(id)}/export`, 'POST', { version, approvalId })
 }
 export function importWorkflow(session: AuthSession, transfer: unknown) {
-  return fetch('/api/workflows/import', { method: 'POST', headers: mutationHeaders(session), body: JSON.stringify(transfer) })
-    .then((response) => parse<{ saved: SavedWorkflow; unresolvedConnections: Array<{ stepId: string; originalSource: string }> }>(response))
+  return mutate<{ saved: SavedWorkflow; unresolvedConnections: Array<{ stepId: string; originalSource: string }> }>(
+    session, '/api/workflows/import', 'POST', transfer)
 }
 export function uploadData(session: AuthSession, format: 'json' | 'csv', file: File, sourceId: string, sourceName: string) {
   const query = new URLSearchParams({ filename: file.name, sourceId, sourceName })
   return fetch(`/api/uploads/${format}?${query}`, { method: 'POST',
     headers: { 'Content-Type': format === 'json' ? 'application/json' : 'text/csv', 'X-CSRF-Token': session.csrfToken }, body: file })
-    .then((response) => parse<{ artifact: import('../shared/workflow').ArtifactSummary; source: DataSource }>(response))
+    .then((response) => parse<{ artifact: import('../shared/workflow').ArtifactSummary; source: AdminDataSource; capability: DataSource }>(response))
 }
 
 export function logout(session: AuthSession) {
-  return fetch('/api/auth/logout', { method: 'POST', headers: mutationHeaders(session) })
-    .then((response) => parse<{ authenticated: false; redirectUrl: string }>(response))
-}
-
-export function appendConversationExchange(session: AuthSession, exchange: {
-  conversationId?: string
-  title: string
-  clientMessageId: string
-  userMessage: string
-  assistantMessage: string
-  workflowId: string
-  workflowVersion: number
-  contextSummary: { changes: string[] }
-}) {
-  return fetch('/api/conversations/exchanges', { method: 'POST', headers: mutationHeaders(session), body: JSON.stringify(exchange) })
-    .then((response) => parse<{ id: string }>(response))
+  return mutate<{ authenticated: false; redirectUrl: string }>(session, '/api/auth/logout', 'POST')
 }

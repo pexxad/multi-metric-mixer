@@ -23,9 +23,13 @@ describe('Workspace repositories', () => {
       })
     }
     const sourceQueries = new DataSourceQueryRepository(database)
-    const sourceAdmin = new DataSourceAdminService(database)
+    const profiles = { listPublic: async () => [], resolve: async (id: string) => id === 'db-c'
+      ? { id, displayName: 'DB C', dataModel: 'documents' as const, uri: 'mongodb://127.0.0.1/metrics', deniedDatasets: [] }
+      : { id, displayName: 'DB A', dataModel: 'table' as const, uri: 'sqlite:///tmp/test.db', deniedDatasets: ['private.*'] } }
+    const sourceAdmin = new DataSourceAdminService(database, profiles)
     const sources = {
       get: sourceQueries.get.bind(sourceQueries),
+      getVersion: sourceQueries.getVersion.bind(sourceQueries),
       list: sourceQueries.list.bind(sourceQueries),
       register: sourceAdmin.register.bind(sourceAdmin),
       update: sourceAdmin.update.bind(sourceAdmin),
@@ -95,25 +99,58 @@ describe('Workspace repositories', () => {
     })).rejects.toThrow('管理者だけが変更できます')
   })
 
-  it('persists SQL and MongoDB metadata with secret references but no credentials', async () => {
+  it('rejects configured and built-in database namespaces before persistence', async () => {
+    const { createContext, sources } = await setup()
+    const admin = await createContext('admin')
+    await expect(sources.register(admin, { id: 'private-data', name: 'Private', type: 'database-table',
+      connectionId: 'db-a', schema: 'private', table: 'payroll', maxRows: 100 })).rejects.toThrow('登録できません')
+    await expect(sources.register(admin, { id: 'system-data', name: 'System', type: 'database-documents',
+      connectionId: 'db-c', database: 'admin', collection: 'users', maxDocuments: 100 })).rejects.toThrow('登録できません')
+  })
+
+  it('persists logical database targets without credentials or implementation details', async () => {
     const { createContext, sources } = await setup()
     const alice = await createContext('alice')
-    await sources.register(alice, { id: 'sales', name: 'Sales', type: 'sql', driver: 'postgresql',
-      secretId: 'production/postgres', schema: 'public', table: 'sales', maxRows: 100 })
-    await sources.register(alice, { id: 'events', name: 'Events', type: 'mongodb', secretId: 'production/mongodb',
+    await sources.register(alice, { id: 'sales', name: 'Sales', type: 'database-table', connectionId: 'db-a',
+      schema: 'public', table: 'sales', maxRows: 100 })
+    await sources.register(alice, { id: 'events', name: 'Events', type: 'database-documents', connectionId: 'db-c',
       database: 'metrics', collection: 'events', maxDocuments: 100 })
     const registered = await sources.list(alice)
-    expect(registered.map((source) => source.type).toSorted()).toEqual(['mongodb', 'sql'])
-    expect(JSON.stringify(registered)).not.toContain('connectionString')
+    expect(registered.map((source) => source.type).toSorted()).toEqual(['database-documents', 'database-table'])
+    expect(JSON.stringify(registered)).not.toContain('uri')
     expect(JSON.stringify(registered)).not.toContain('password')
+  })
+
+  it('resolves the immutable data-source version pinned by a Workflow query template', async () => {
+    const { createContext, sources } = await setup()
+    const admin = await createContext('admin')
+    const first = await sources.register(admin, { id: 'logs', name: 'Logs', type: 'cloudwatch-logs',
+      region: 'ap-northeast-1', logGroupName: '/app/logs', maxResults: 1000, maxRangeSeconds: 604800,
+      queryMode: 'template-required', queryTemplates: [{ id: 'errors', name: 'Errors v1', description: '',
+        outputDataModel: 'documents', variables: [
+          { id: 'startTime', label: '開始', input: 'datetime', type: 'datetime', required: true },
+          { id: 'endTime', label: '終了', input: 'datetime', type: 'datetime', required: true },
+        ], execution: { kind: 'cloudwatch-logs-insights', query: 'fields @message',
+          startTimeVariable: 'startTime', endTimeVariable: 'endTime' } }] })
+    if (first.type !== 'cloudwatch-logs') throw new Error('unexpected source type')
+    const { version: _version, accessMode: _accessMode, status: _status, ...firstDefinition } = first
+    await sources.update(admin, 'logs', { ...firstDefinition, name: 'Logs', queryTemplates: [{
+      ...first.queryTemplates[0]!, name: 'Errors v2',
+    }] }, 1)
+    expect(await sources.getVersion(admin, 'logs', 1)).toMatchObject({
+      version: 1, queryTemplates: [{ name: 'Errors v1' }],
+    })
+    expect(await sources.get(admin, 'logs')).toMatchObject({
+      version: 2, queryTemplates: [{ name: 'Errors v2' }],
+    })
   })
 
   it('keeps the Workspace canonical Catalog separate from personal changes and can reset or promote them', async () => {
     const { createContext, sources, catalogs } = await setup()
     const admin = await createContext('admin')
     const user = await createContext('alice', 'user')
-    await sources.register(admin, { id: 'sales', name: 'Sales', type: 'sql', driver: 'sqlite',
-      secretId: 'local/sqlite', table: 'sales', maxRows: 100 })
+    await sources.register(admin, { id: 'sales', name: 'Sales', type: 'database-table', connectionId: 'db-a',
+      table: 'sales', maxRows: 100 })
     const base = { sourceId: 'sales', displayName: '売上', description: '', policy: 'curated' as const,
       classification: 'confidential' as const, defaultTimeField: null, relationships: [],
       fields: [{ path: 'amount', dataTypes: ['number' as const], nullable: false, presence: 1,
@@ -141,7 +178,7 @@ describe('Workspace repositories', () => {
     const { createContext, sources, catalogs } = await setup()
     const admin = await createContext('admin')
     const user = await createContext('analyst', 'user')
-    await sources.register(admin, { id: 'events', name: 'Events', type: 'mongodb', secretId: 'local/mongodb',
+    await sources.register(admin, { id: 'events', name: 'Events', type: 'database-documents', connectionId: 'db-c',
       database: 'metrics', collection: 'events', maxDocuments: 100 })
     await catalogs.saveCanonical(admin, 'events', { sourceId: 'events', displayName: 'イベント', description: '', policy: 'evolving',
       classification: 'internal', defaultTimeField: null, relationships: [], fields: [

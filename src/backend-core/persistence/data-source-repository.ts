@@ -5,6 +5,7 @@ export { dataSourceRegistrationSchema, type DataSource, type DataSourceRegistrat
 
 export interface DataSourceReader {
   get(context: RequestContext, id: string): Promise<DataSource | undefined>
+  getVersion?(context: RequestContext, id: string, version: number): Promise<DataSource | undefined>
   list(context: RequestContext): Promise<DataSource[]>
 }
 
@@ -16,6 +17,14 @@ export class DataSourceQueryRepository implements DataSourceReader {
       .where('workspace_id', '=', context.workspace.id).where('id', '=', id).where('status', '=', 'active')
       .executeTakeFirst() as { definition_json: string; version: number; status: 'active' } | undefined
     return row ? { ...dataSourceRegistrationSchema.parse(JSON.parse(row.definition_json)), version: row.version, accessMode: 'read-only', status: row.status } : undefined
+  }
+
+  async getVersion(context: RequestContext, id: string, version: number): Promise<DataSource | undefined> {
+    const row = await this.database.query.selectFrom('data_source_versions').select('definition_json')
+      .where('workspace_id', '=', context.workspace.id).where('data_source_id', '=', id).where('version', '=', version)
+      .executeTakeFirst() as { definition_json: string } | undefined
+    return row ? { ...dataSourceRegistrationSchema.parse(JSON.parse(row.definition_json)), version,
+      accessMode: 'read-only', status: 'active' } : undefined
   }
 
   async list(context: RequestContext): Promise<DataSource[]> {

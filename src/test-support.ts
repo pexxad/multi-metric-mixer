@@ -42,7 +42,7 @@ export function backendContext(overrides: Partial<RequestContext> = {}): Request
   }
 }
 
-export function testCapabilityKeys() {
+export function testBackendAccessTokenKeys() {
   const pair = generateKeyPairSync('ed25519')
   return {
     privateKeyBase64: pair.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64'),

@@ -4,24 +4,44 @@ import { cors } from 'hono/cors'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { requestId } from 'hono/request-id'
 import { secureHeaders } from 'hono/secure-headers'
+import { streamSSE } from 'hono/streaming'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { z } from 'zod'
 import type { RuntimeConfig } from './config'
 import { AppError, toProblemDetails } from '../shared/errors'
+import type { ProblemDetails } from '../shared/errors'
 import type { BffServices } from './runtime'
 import type { RequestIdentity } from './auth/session-service'
-import { dataSourceRegistrationSchema } from '../shared/data-source'
+import { dataSourceCapability, dataSourceRegistrationSchema } from '../shared/data-source'
 import { canExport, canManageDataSources, canRun, type RequestContext } from '../shared/request-context'
-import { MCP_DATA_SOURCE_ACCESS, MCP_TOOL_COUNT } from '../shared/mcp-contract'
 import { sampleWorkflow, workflowSchema } from '../shared/workflow'
-import type { WorkflowRun } from '../shared/workflow'
-import { conversationExchangeSchema } from './persistence/conversation-repository'
-import { catalogDefinitionSchema, type CatalogObservation } from '../shared/catalog'
-import type { DataSource } from '../shared/data-source'
+import { catalogDefinitionSchema } from '../shared/catalog'
+import { orchestrateAgentRequest } from './agent/agent-orchestrator'
 
 type Variables = { identity: RequestIdentity; sessionToken: string; requestId: string }
 type AppEnv = { Variables: Variables }
 export type AppDependencies = { config: RuntimeConfig; services: BffServices }
+const agentRequestSchema = z.object({
+  conversationId: z.string().min(1).optional(),
+  clientMessageId: z.string().min(1).max(128),
+  message: z.string().min(1).max(10_000),
+  workflow: workflowSchema,
+}).strict()
+
+function logRequestFailure(config: RuntimeConfig, error: unknown, problem: ProblemDetails): void {
+  if (problem.status < 500) return
+  console.error(JSON.stringify({
+    level: 'error',
+    event: 'request_failed',
+    requestId: problem.requestId,
+    code: problem.code,
+    ...(config.release.endsWith('-local') && error instanceof Error ? {
+      errorName: error.name,
+      errorMessage: error.message,
+      ...(error instanceof AppError && error.details ? { errorDetails: error.details } : {}),
+    } : {}),
+  }))
+}
 
 function secureCookie(config: RuntimeConfig): boolean {
   return new URL(config.publicServer.origin).protocol === 'https:'
@@ -51,18 +71,12 @@ function dataSourceAdminContext(c: Context<AppEnv>): RequestContext {
   return context
 }
 
-function catalogProfileParameters(source: DataSource): Record<string, string> {
-  if (source.type === 'dynamodb') return { operation: 'Scan' }
-  if (source.type === 'cloudwatch-logs') return { query: 'fields @timestamp, @message | limit 100' }
-  if (source.type === 'sql' || source.type === 'mongodb') return { limit: '100' }
-  return {}
-}
-
-function sampleReadParameters(source: DataSource, limit: number): Record<string, string> {
-  if (source.type === 'sql' || source.type === 'mongodb') return { limit: String(limit) }
-  if (source.type === 'cloudwatch-logs') return { query: `fields @timestamp, @message | limit ${limit}` }
-  if (source.type === 'dynamodb') return { operation: 'Scan' }
-  return {}
+function browserConversation<T extends { messages: Array<{ metadata?: unknown }> }>(conversation: T): T {
+  return { ...conversation, messages: conversation.messages.map((message) => {
+    if (!message.metadata || typeof message.metadata !== 'object' || Array.isArray(message.metadata)) return message
+    const { provider: _provider, ...metadata } = message.metadata as Record<string, unknown>
+    return { ...message, metadata }
+  }) }
 }
 
 function authenticate({ config, services }: AppDependencies): MiddlewareHandler<AppEnv> {
@@ -110,12 +124,7 @@ export function createPublicApp(dependencies: AppDependencies) {
   }))
   app.onError(async (error, c) => {
     const problem = toProblemDetails(error, c.get('requestId'))
-    if (problem.status >= 500) console.error(JSON.stringify({ level: 'error', event: 'request_failed', requestId: problem.requestId,
-      code: problem.code, ...(config.release.endsWith('-local') && error instanceof Error ? {
-        errorName: error.name,
-        errorMessage: error.message,
-        ...(error instanceof AppError && error.details ? { errorDetails: error.details } : {}),
-      } : {}) }))
+    logRequestFailure(config, error, problem)
     const identity = c.get('identity') as RequestIdentity | undefined
     const isAuthentication = c.req.path.startsWith('/auth/')
     const isDenied = problem.status === 401 || problem.status === 403
@@ -141,8 +150,13 @@ export function createPublicApp(dependencies: AppDependencies) {
     const rotated = token ? await services.sessions.rotate(token) : undefined
     if (!rotated) return c.json({ authenticated: false, providers: services.providers.publicMetadata() }, 401)
     setCookie(c, sessionCookieName(config), rotated.token, cookieOptions(config, config.auth.sessionTtlSeconds))
-    return c.json({ authenticated: true, principal: rotated.identity.principal, workspace: rotated.identity.workspace,
-      applicationRole: rotated.identity.applicationRole, assuranceLevel: rotated.identity.assuranceLevel, csrfToken: rotated.csrfToken })
+    return c.json({
+      authenticated: true,
+      principal: { displayName: rotated.identity.principal.displayName },
+      workspace: { name: rotated.identity.workspace.name, role: rotated.identity.workspace.role },
+      applicationRole: rotated.identity.applicationRole,
+      csrfToken: rotated.csrfToken,
+    })
   })
   app.get('/auth/login/:providerKey', async (c) => {
     const started = await services.auth.begin(c.req.param('providerKey'), c.req.query('returnTo'))
@@ -181,22 +195,26 @@ export function createPublicApp(dependencies: AppDependencies) {
     ])
     return c.json({
       workflowTemplate: sampleWorkflow,
-      workflows, conversations, dataSources, catalogs,
-      principal: context.principal,
-      workspace: context.workspace,
-      applicationRole: context.applicationRole,
-      mcp: { transport: 'instance-local Streamable HTTP', tools: MCP_TOOL_COUNT, dataSourceAccess: MCP_DATA_SOURCE_ACCESS },
-      agent: services.agent.model.metadata,
+      workflows, conversations,
+      dataSources,
+      catalogs,
     })
   })
-  app.get('/api/data-sources', async (c) => c.json({ sources: await services.sources.list(requestContext(c)) }))
+  app.get('/api/data-sources', async (c) => {
+    const context = requestContext(c)
+    return c.json({ sources: context.applicationRole === 'admin'
+      ? await services.sources.listAdmin(context)
+      : await services.sources.list(context) })
+  })
+  app.get('/api/connection-profiles', async (c) =>
+    c.json({ connections: await services.connectionProfiles.list(dataSourceAdminContext(c)) }))
   app.post('/api/data-sources', async (c) => {
     const context = dataSourceAdminContext(c)
     const body = dataSourceRegistrationSchema.parse(await c.req.json<unknown>())
     const source = await services.sources.register(context, body)
     await services.audit.record(context, { type: 'connection.created', outcome: 'success', resourceType: 'data-source',
       resourceId: source.id, summary: { type: source.type, version: source.version } })
-    return c.json({ source }, 201)
+    return c.json({ source, capability: dataSourceCapability(source) }, 201)
   })
   app.patch('/api/data-sources/:id', async (c) => {
     const context = dataSourceAdminContext(c)
@@ -205,20 +223,17 @@ export function createPublicApp(dependencies: AppDependencies) {
     const source = await services.sources.update(context, c.req.param('id'), body.source, body.expectedVersion)
     await services.audit.record(context, { type: 'connection.updated', outcome: 'success', resourceType: 'data-source',
       resourceId: source.id, summary: { type: source.type, version: source.version } })
-    return c.json({ source })
+    return c.json({ source, capability: dataSourceCapability(source) })
   })
   app.get('/api/data-sources/:id/impact', async (c) => c.json({
     workflows: await services.workflows.connectionUsage(dataSourceAdminContext(c), c.req.param('id')),
   }))
   app.post('/api/data-sources/:id/test', async (c) => {
     const context = dataSourceAdminContext(c)
-    const source = await services.sources.get(context, c.req.param('id'))
-    if (!source) throw new AppError('source_not_found', 404, 'データソースが見つかりません。')
-    const body = z.object({ parameters: z.record(z.string(), z.string()).default({}) }).strict().parse(await c.req.json<unknown>())
-    const artifact = await services.mcp.call<import('../shared/workflow').ArtifactSummary>(context, 'data_source_read',
-      { source: source.id, parameters: body.parameters })
+    const sourceId = c.req.param('id')
+    const artifact = await services.sources.test(context, sourceId)
     await services.audit.record(context, { type: 'connection.tested', outcome: 'success', resourceType: 'data-source',
-      resourceId: source.id, summary: { type: source.type, version: source.version, rows: artifact.rowCount } })
+      resourceId: sourceId, summary: { rows: artifact.rowCount } })
     return c.json({ artifact })
   })
   app.delete('/api/data-sources/:id', async (c) => {
@@ -272,14 +287,11 @@ export function createPublicApp(dependencies: AppDependencies) {
   })
   app.post('/api/catalog/:sourceId/explore', async (c) => {
     const context = requestContext(c)
-    const source = await services.sources.get(context, c.req.param('sourceId'))
-    if (!source) throw new AppError('source_not_found', 404, 'データソースが見つかりません。')
-    const profiled = await services.mcp.call<{ observation: CatalogObservation; catalog: Awaited<ReturnType<typeof services.catalogs.savePersonal>> }>(
-      context, 'catalog_explore_personal',
-      { source: source.id, parameters: catalogProfileParameters(source) })
+    const sourceId = c.req.param('sourceId')
+    const profiled = await services.catalogs.explorePersonal(context, sourceId)
     const catalog = profiled.catalog
     await services.audit.record(context, { type: 'catalog.explored', outcome: 'success', resourceType: 'data-source',
-      resourceId: source.id, summary: { personalVersion: catalog.version, fields: catalog.definition.fields.length } })
+      resourceId: sourceId, summary: { personalVersion: catalog.version, fields: catalog.definition.fields.length } })
     return c.json({ catalog }, 201)
   })
 
@@ -325,7 +337,11 @@ export function createPublicApp(dependencies: AppDependencies) {
   app.post('/api/workflows/:id/runs', async (c) => {
     const context = requestContext(c)
     if (!canRun(context)) throw new AppError('workflow_run_denied', 403, 'Workflowを実行する権限がありません。')
-    const body = z.object({ version: z.number().int().positive().optional(), approvalId: z.string().min(1).optional() }).strict().parse(await c.req.json<unknown>())
+    const body = z.object({
+      version: z.number().int().positive().optional(),
+      approvalId: z.string().min(1).optional(),
+      conversationId: z.string().min(1).optional(),
+    }).strict().parse(await c.req.json<unknown>())
     const saved = await services.workflows.require(context, c.req.param('id'), body.version)
     if (!saved.validation.valid) throw new AppError('workflow_not_ready', 409, '設定不足のWorkflowは実行できません。', saved.validation.errors)
     const outputStepIds = saved.workflow.steps.filter((step) => step.kind === 'csv').map((step) => step.id)
@@ -338,81 +354,46 @@ export function createPublicApp(dependencies: AppDependencies) {
     } else if (body.approvalId) {
       throw new AppError('approval_not_applicable', 400, 'このWorkflow実行に承認IDは使用できません。')
     }
-    const run = await services.mcp.call<WorkflowRun>(context, 'workflow_execute',
-      { workflowId: saved.workflow.id, version: saved.version }, saved.contentHash, body.approvalId)
+    const run = await services.runs.execute(context, saved.workflow.id, saved.version, saved.contentHash, body.approvalId)
+    if (body.conversationId) {
+      await services.conversations.appendSystemEvent(context, {
+        conversationId: body.conversationId,
+        deduplicationId: `workflow-run:${run.id}`,
+        content: `「${saved.workflow.name}」を実行しました。`,
+        metadata: { type: 'workflow_run', run },
+        workflowId: saved.workflow.id,
+        workflowVersion: saved.version,
+      })
+    }
     await services.audit.record(context, { type: 'workflow.run', outcome: 'success', resourceType: 'workflow',
       resourceId: c.req.param('id'), summary: { runId: run.id, durationMs: run.durationMs, steps: run.steps.length } })
     return c.json({ run }, 201)
   })
-  app.post('/api/workflows/validate', async (c) => {
-    const result = await services.workflows.validate(requestContext(c), await c.req.json<unknown>())
-    return c.json(result, result.valid ? 200 : 400)
-  })
   app.post('/api/agent/respond', async (c) => {
-    const context = requestContext(c)
-    const body = z.object({ conversationId: z.string().min(1).optional(), clientMessageId: z.string().min(1).max(128),
-      message: z.string().min(1).max(10_000), workflow: workflowSchema }).strict().parse(await c.req.json<unknown>())
-    const [conversation, sources, catalogs] = await Promise.all([
-      body.conversationId ? services.conversations.require(context, body.conversationId) : Promise.resolve(undefined),
-      services.sources.list(context),
-      services.catalogs.listEffective(context),
-    ])
-    let response = await services.agent.respond({ message: body.message, workflow: body.workflow,
-      dataSources: sources.map((source) => ({ id: source.id, name: source.name, type: source.type })),
-      catalogs: catalogs.map(({ sourceId, version, scope, baseCanonicalVersion, definition }) => ({
-        sourceId, version, scope, ...(baseCanonicalVersion ? { baseCanonicalVersion } : {}), definition,
-      })),
-      history: conversation?.messages.flatMap((message) => message.role === 'system'
-        ? [] : [{ role: message.role, content: message.content }]) ?? [] })
-    if (response.state === 'exploration') {
-      const allowedSources = new Map(sources.map((source) => [source.id, source]))
-      const requested = [...new Set(response.sourceIds)].map((id) => allowedSources.get(id))
-      if (requested.some((source) => !source)) throw new AppError('agent_unknown_data_source', 400, 'Agentが未登録のデータソースを探索しようとしました。')
-      const profiles = await Promise.all(requested.map(async (source) => ({ source: source!,
-        profiled: await services.mcp.call<{ observation: CatalogObservation; catalog: Awaited<ReturnType<typeof services.catalogs.savePersonal>> }>(
-          context, 'catalog_explore_personal',
-          { source: source!.id, parameters: catalogProfileParameters(source!) }),
-      })))
-      const observations = []
-      for (const { profiled } of profiles) observations.push(profiled.catalog)
-      const refreshedCatalogs = await services.catalogs.listEffective(context)
-      await services.audit.record(context, { type: 'agent.catalog.explored', outcome: 'success', resourceType: 'conversation',
-        resourceId: conversation?.id, summary: { sources: observations.map((catalog) => catalog.sourceId), fields: observations.reduce((sum, catalog) => sum + catalog.definition.fields.length, 0) } })
-      response = await services.agent.respond({ message: body.message, workflow: body.workflow,
-        dataSources: sources.map((source) => ({ id: source.id, name: source.name, type: source.type })),
-        catalogs: refreshedCatalogs.map(({ sourceId, version, scope, baseCanonicalVersion, definition }) => ({
-          sourceId, version, scope, ...(baseCanonicalVersion ? { baseCanonicalVersion } : {}), definition,
-        })),
-        history: [...(conversation?.messages.flatMap((message) => message.role === 'system'
-          ? [] : [{ role: message.role, content: message.content }]) ?? []),
-        { role: 'assistant', content: `探索を完了し、次の結果を自分用Data Catalogへ保存しました: ${observations.map((catalog) => catalog.sourceId).join('、')}。元の依頼がCatalogの推測・保存だけなら、Workflowを提案せず保存完了を回答してください。分析や集計も依頼されている場合だけ、保存したCatalogを使って続行してください。` }] })
-    }
-    let sampleArtifact: import('../shared/workflow').ArtifactSummary | undefined
-    if (response.state === 'sample') {
-      const source = sources.find((item) => item.id === response.sourceIds[0])
-      if (!source) throw new AppError('agent_unknown_data_source', 400, 'Agentが未登録のデータソースからサンプルを取得しようとしました。')
-      const read = await services.mcp.call<import('../shared/workflow').ArtifactSummary>(context, 'data_source_read',
-        { source: source.id, parameters: sampleReadParameters(source, response.limit) })
-      sampleArtifact = await services.mcp.call<import('../shared/workflow').ArtifactSummary>(context, 'artifact_preview',
-        { artifactId: read.id, config: { limit: response.limit } })
-      await services.audit.record(context, { type: 'agent.sample.read', outcome: 'success', resourceType: 'data-source',
-        resourceId: source.id, summary: { rows: sampleArtifact.rowCount, limit: response.limit } })
-    }
-    const responseMetadata = { ...response, ...(sampleArtifact ? { artifact: sampleArtifact } : {}) }
-    const savedConversation = await services.conversations.appendExchange(context, {
-      conversationId: conversation?.id,
-      title: conversation?.title ?? body.message.slice(0, 80),
-      clientMessageId: body.clientMessageId,
-      userMessage: body.message,
-      assistantMessage: response.message,
-      assistantMetadata: responseMetadata,
-    })
-    await services.audit.record(context, { type: 'agent.responded', outcome: 'success', resourceType: 'conversation',
-      resourceId: savedConversation.id, summary: { state: response.state, provider: services.agent.model.metadata.provider } })
-    return c.json({ ...responseMetadata, provider: services.agent.model.metadata, conversationId: savedConversation.id })
+    const result = await orchestrateAgentRequest(services, requestContext(c), agentRequestSchema.parse(await c.req.json<unknown>()))
+    return c.json(result)
   })
-  app.get('/api/conversations', async (c) => c.json({ conversations: await services.conversations.list(requestContext(c)) }))
-  app.get('/api/conversations/:id', async (c) => c.json(await services.conversations.require(requestContext(c), c.req.param('id'))))
+  app.post('/api/agent/respond/stream', async (c) => {
+    const context = requestContext(c)
+    const input = agentRequestSchema.parse(await c.req.json<unknown>())
+    return streamSSE(c, async (stream) => {
+      let pendingWrite = Promise.resolve()
+      const write = (event: string, value: unknown) => {
+        pendingWrite = pendingWrite.then(() => stream.writeSSE({ event, data: JSON.stringify(value) }))
+        return pendingWrite
+      }
+      try {
+        const result = await orchestrateAgentRequest(services, context, input, (activity) => write('activity', activity))
+        await write('response', result)
+      } catch (error) {
+        const problem = toProblemDetails(error, context.requestId)
+        logRequestFailure(config, error, problem)
+        await write('error', problem)
+      }
+    })
+  })
+  app.get('/api/conversations/:id', async (c) =>
+    c.json(browserConversation(await services.conversations.require(requestContext(c), c.req.param('id')))))
   app.post('/api/conversations/:id/workflow-link', async (c) => {
     const context = requestContext(c)
     const body = z.object({ workflowId: z.string().min(1), workflowVersion: z.number().int().positive() }).strict()
@@ -422,17 +403,6 @@ export function createPublicApp(dependencies: AppDependencies) {
   })
   app.get('/api/runs', async (c) => c.json({ runs: await services.runs.list(requestContext(c)) }))
   app.get('/api/artifacts', async (c) => c.json({ artifacts: await services.artifacts.list(requestContext(c)) }))
-  app.post('/api/conversations/exchanges', async (c) => {
-    const context = requestContext(c)
-    const exchange = conversationExchangeSchema.parse(await c.req.json<unknown>())
-    if (exchange.workflowId && exchange.workflowVersion) {
-      await services.workflows.require(context, exchange.workflowId, exchange.workflowVersion)
-    }
-    const conversation = await services.conversations.appendExchange(context, exchange)
-    await services.audit.record(context, { type: 'conversation.exchange_saved', outcome: 'success', resourceType: 'conversation',
-      resourceId: conversation.id, summary: { workflowId: exchange.workflowId, workflowVersion: exchange.workflowVersion } })
-    return c.json(conversation, 201)
-  })
   app.post('/api/workflows/:id/export-approvals', async (c) => {
     const context = requestContext(c)
     if (!canExport(context)) throw new AppError('workflow_export_denied', 403, 'Workflowをexportする権限がありません。')
@@ -481,7 +451,7 @@ export function createPublicApp(dependencies: AppDependencies) {
         bytes: Number(c.req.header('Content-Length') ?? 0),
         rows: uploaded.artifact.rowCount,
       } })
-    return c.json(uploaded, 201)
+    return c.json({ ...uploaded, capability: dataSourceCapability(uploaded.source) }, 201)
   })
   app.post('/api/artifacts/:id/download-approvals', async (c) => {
     const context = requestContext(c)

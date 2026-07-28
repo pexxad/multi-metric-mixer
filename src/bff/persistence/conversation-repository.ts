@@ -1,24 +1,20 @@
 import { randomUUID } from 'node:crypto'
 import { sql } from 'kysely'
-import { z } from 'zod'
 import { AppError } from '../../shared/errors'
 import type { RequestContext } from '../../shared/request-context'
 import type { BffDatabase } from '../persistence/bff-database'
 
-export const conversationExchangeSchema = z.object({
-  conversationId: z.string().min(1).optional(),
-  title: z.string().min(1).max(200).default('新しい会話'),
-  clientMessageId: z.string().min(1).max(128),
-  userMessage: z.string().min(1).max(10_000),
-  assistantMessage: z.string().min(1).max(20_000),
-  assistantMetadata: z.unknown().optional(),
-  workflowId: z.string().min(1).optional(),
-  workflowVersion: z.number().int().positive().optional(),
-  contextSummary: z.object({ changes: z.array(z.string().max(500)).max(100) }).strict().optional(),
-}).strict().refine((value) => Boolean(value.workflowId) === Boolean(value.workflowVersion), {
-  message: 'workflowId and workflowVersion must be provided together',
-})
-export type ConversationExchange = z.infer<typeof conversationExchangeSchema>
+export type ConversationExchange = {
+  conversationId?: string
+  title: string
+  clientMessageId: string
+  userMessage: string
+  assistantMessage: string
+  assistantMetadata?: unknown
+  workflowId?: string
+  workflowVersion?: number
+  contextSummary?: { changes: string[] }
+}
 
 export type ConversationMessage = {
   id: string
@@ -37,6 +33,15 @@ export type Conversation = {
   workflowId: string | null
   updatedAt: string
   messages: ConversationMessage[]
+}
+
+type ConversationSystemEvent = {
+  conversationId: string
+  deduplicationId: string
+  content: string
+  metadata: unknown
+  workflowId: string
+  workflowVersion: number
 }
 
 export class ConversationRepository {
@@ -88,6 +93,38 @@ export class ConversationRepository {
         .where('conversation_id', '=', conversationId).where('workflow_id', 'is', null).execute()
     })
     return this.require(context, conversationId)
+  }
+
+  async appendSystemEvent(context: RequestContext, input: ConversationSystemEvent): Promise<Conversation> {
+    await this.database.query.transaction().execute(async (db) => {
+      const conversation = await db.selectFrom('conversations').select('id')
+        .where('id', '=', input.conversationId).where('workspace_id', '=', context.workspace.id).executeTakeFirst()
+      if (!conversation) throw new AppError('conversation_not_found', 404, '会話が見つかりません。')
+      const seen = await db.selectFrom('chat_messages').select('id').where('conversation_id', '=', input.conversationId)
+        .where('client_message_id', '=', input.deduplicationId).executeTakeFirst()
+      if (seen) return
+      const max = await db.selectFrom('chat_messages').select(sql<number>`coalesce(max(sequence), 0)`.as('value'))
+        .where('conversation_id', '=', input.conversationId).executeTakeFirstOrThrow()
+      const now = new Date().toISOString()
+      await db.insertInto('chat_messages').values({
+        id: `msg_${randomUUID()}`,
+        conversation_id: input.conversationId,
+        sequence: Number(max.value) + 1,
+        role: 'system',
+        content_text: input.content,
+        metadata_json: JSON.stringify(input.metadata),
+        workflow_id: input.workflowId,
+        workflow_version: input.workflowVersion,
+        client_message_id: input.deduplicationId,
+        created_by: null,
+        created_at: now,
+      }).execute()
+      await db.updateTable('conversations').set({
+        workflow_id: input.workflowId,
+        updated_at: now,
+      }).where('id', '=', input.conversationId).where('workspace_id', '=', context.workspace.id).execute()
+    })
+    return this.require(context, input.conversationId)
   }
 
   async list(context: RequestContext): Promise<Array<Omit<Conversation, 'messages'>>> {

@@ -41,7 +41,7 @@ describe('WorkflowExecutionService', () => {
       new WorkflowTools(artifacts), new RunLimitService(database, 2))
     const run = await execution.execute(context, saved.workflow.id, saved.version)
     expect(run.status).toBe('completed')
-    expect(run.steps).toHaveLength(3)
+    expect(run.steps).toHaveLength(4)
     expect(run.finalArtifact.type).toBe('csv')
     expect(await database.query.selectFrom('runs').select('status').where('id', '=', run.id).executeTakeFirst()).toMatchObject({ status: 'completed' })
   })
@@ -90,5 +90,56 @@ describe('WorkflowExecutionService', () => {
 
     expect(sorted.rows).toEqual([{ region: 'West', sum_numericAmount: 20 }])
     expect(sorted.provenance).toContain('limit:1')
+  })
+
+  it('counts all rows after filtering without requiring an artificial grouping column', async () => {
+    const database = await testBackendDatabase(); databases.push(database)
+    const context = backendContext({ requestId: 'global-count' })
+    const artifacts = new ArtifactRepository(database, new MemoryArtifactContentStore())
+    const tools = new WorkflowTools(artifacts)
+    const sales = await artifacts.createTable(context, 'sales', [
+      { category: 'Hardware' },
+      { category: 'Software' },
+      { category: 'Hardware' },
+    ], ['test'])
+    const hardware = await tools.filterSelect(context, sales.id, {
+      columns: [],
+      filters: [{ field: 'category', operator: 'eq', value: 'Hardware' }],
+    })
+
+    const count = await tools.aggregate(context, hardware.id, {
+      groupBy: null,
+      metric: null,
+      operation: 'count',
+    })
+
+    expect(count.rows).toEqual([{ count: 2 }])
+  })
+
+  it('parses one explicit JSON array into scalar table columns before aggregation', async () => {
+    const database = await testBackendDatabase(); databases.push(database)
+    const context = backendContext({ requestId: 'parse-documents' })
+    const artifacts = new ArtifactRepository(database, new MemoryArtifactContentStore())
+    const documents = await artifacts.createDocuments(context, 'orders', [[
+      { region: '東', amount: '120' },
+      { region: '西', amount: '80' },
+    ]], ['test'])
+    const tools = new WorkflowTools(artifacts)
+    const parsed = await tools.parseDocuments(context, documents.id, {
+      recordPath: '$[]',
+      columns: [
+        { name: 'region', path: '$.region', dataType: 'string' },
+        { name: 'amount', path: '$.amount', dataType: 'number' },
+      ],
+      onMissing: 'null',
+      onTypeMismatch: 'error',
+    })
+    expect(parsed).toMatchObject({ type: 'table', columns: ['region', 'amount'],
+      rows: [{ region: '東', amount: 120 }, { region: '西', amount: 80 }] })
+    const preview = await tools.preview(context, documents.id, { limit: 1 })
+    expect(preview).toMatchObject({ type: 'documents', rowCount: 1, documents: [{ region: '東', amount: '120' }] })
+    await expect(tools.aggregate(context, documents.id, {
+      groupBy: 'region', metric: 'amount', operation: 'sum',
+    })).rejects.toMatchObject({ code: 'artifact_type_mismatch' })
   })
 })

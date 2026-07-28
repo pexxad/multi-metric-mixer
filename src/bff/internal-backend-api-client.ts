@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { AppError } from '../shared/errors'
 import type { RequestContext } from '../shared/request-context'
-import type { BackendCapabilityIssuer } from '../shared/backend-capability'
-import { contentHash } from '../shared/canonical-hash'
+import type { BackendAccessTokenIssuer } from '../shared/backend-access-token'
 import type { StoredArtifact, SavedWorkflow, WorkflowChangeSource } from '../shared/backend-contract'
-import type { DataSource } from '../shared/data-source'
+import type { DataSource, DataSourceCapability } from '../shared/data-source'
+import type { PublicConnectionProfile } from '../shared/connection-profile'
 import type { CatalogBundle, CatalogVersion } from '../shared/catalog'
 import type { CatalogDefinition } from '../shared/catalog'
 import type { Workflow } from '../shared/workflow'
@@ -12,7 +12,7 @@ import type { Workflow } from '../shared/workflow'
 type ClientOptions = {
   url: URL
   origin: string
-  capabilities: BackendCapabilityIssuer
+  accessTokens: BackendAccessTokenIssuer
   fetch?: typeof fetch
 }
 
@@ -41,21 +41,21 @@ export class InternalBackendApiClient {
     operation: string,
     input: Record<string, unknown> = {},
     scopes: string[] = ['backend:api'],
+    binding: { workflowContentHash?: string; approvalId?: string } = {},
   ): Promise<T> {
     const invocationContext = { ...context, requestId: `${context.requestId}.${randomUUID()}` }
     const body = { operation, input }
-    const token = this.options.capabilities.issue(invocationContext, {
-      action: `api:${operation}`,
-      inputHash: contentHash(body),
-      scopes,
-    })
+    const token = await this.options.accessTokens.issue(invocationContext, scopes)
     const response = await this.fetcher(new URL('/internal/api', this.options.url), {
       method: 'POST',
       headers: {
         Host: this.options.url.host,
         Origin: this.options.origin,
         Authorization: `Bearer ${token}`,
+        'X-Request-Id': invocationContext.requestId,
         'Content-Type': 'application/json',
+        ...(binding.workflowContentHash ? { 'X-Workflow-Content-Hash': binding.workflowContentHash } : {}),
+        ...(binding.approvalId ? { 'X-Approval-Id': binding.approvalId } : {}),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
@@ -69,14 +69,23 @@ export class InternalBackendApiClient {
   }
 
   readonly sources = {
-    list: (context: RequestContext) => this.call<DataSource[]>(context, 'dataSource.list'),
-    get: (context: RequestContext, id: string) => this.call<DataSource | undefined>(context, 'dataSource.get', { id }),
+    list: (context: RequestContext) => this.call<DataSourceCapability[]>(context, 'dataSource.list'),
+    listAdmin: (context: RequestContext) =>
+      this.call<DataSource[]>(context, 'dataSource.listAdmin', {}, ['backend:api', 'connections:admin']),
     register: (context: RequestContext, source: unknown) =>
       this.call<DataSource>(context, 'dataSource.register', { source }, ['backend:api', 'connections:admin']),
     update: (context: RequestContext, id: string, source: unknown, expectedVersion: number) =>
       this.call<DataSource>(context, 'dataSource.update', { id, source, expectedVersion }, ['backend:api', 'connections:admin']),
     archive: (context: RequestContext, id: string) =>
       this.call<boolean>(context, 'dataSource.archive', { id }, ['backend:api', 'connections:admin']),
+    test: (context: RequestContext, id: string, limit = 10) =>
+      this.call<import('../shared/workflow').ArtifactSummary>(context, 'dataSource.test', { id, limit },
+        ['backend:api', 'connections:admin']),
+  }
+
+  readonly connectionProfiles = {
+    list: (context: RequestContext) =>
+      this.call<PublicConnectionProfile[]>(context, 'connectionProfile.list', {}, ['backend:api', 'connections:admin']),
   }
 
   readonly catalogs = {
@@ -90,6 +99,9 @@ export class InternalBackendApiClient {
       this.call<CatalogVersion>(context, 'catalog.saveCanonical', { sourceId, definition, expectedVersion }),
     promotePersonal: (context: RequestContext, sourceId: string, expectedCanonicalVersion?: number) =>
       this.call<CatalogVersion>(context, 'catalog.promotePersonal', { sourceId, expectedCanonicalVersion }),
+    explorePersonal: (context: RequestContext, sourceId: string, limit = 100) =>
+      this.call<{ observation: import('../shared/catalog').CatalogObservation; catalog: CatalogVersion;
+        artifact: import('../shared/workflow').ArtifactSummary }>(context, 'catalog.explorePersonal', { sourceId, limit }),
   }
 
   readonly workflows = {
@@ -103,12 +115,13 @@ export class InternalBackendApiClient {
       this.call<boolean>(context, 'workflow.archive', { id, expectedVersion }),
     connectionUsage: (context: RequestContext, id: string) =>
       this.call<Array<{ workflowId: string; workflowName: string; version: number }>>(context, 'dataSource.connectionUsage', { id }),
-    validate: (context: RequestContext, workflow: unknown) =>
-      this.call<{ valid: boolean; errors: string[] }>(context, 'workflow.validate', { workflow }),
   }
 
   readonly runs = {
     list: (context: RequestContext) => this.call<unknown[]>(context, 'run.list'),
+    execute: (context: RequestContext, id: string, version: number, workflowContentHash: string, approvalId?: string) =>
+      this.call<import('../shared/workflow').WorkflowRun>(context, 'workflow.execute', { id, version }, ['backend:api'],
+        { workflowContentHash, ...(approvalId ? { approvalId } : {}) }),
   }
 
   readonly artifacts = {

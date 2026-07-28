@@ -1,6 +1,6 @@
 import { Worker } from 'node:worker_threads'
 import { AppError } from '../shared/errors'
-import type { TableRow } from '../shared/workflow'
+import type { JsonValue, TableRow } from '../shared/workflow'
 import type { UploadLimits } from './upload-ingestion'
 
 const workerSource = String.raw`
@@ -27,46 +27,41 @@ function validateJson(value, limits) {
     }
   }
 }
-function jsonRows(value, maxRows) {
-  const record = (item) => item && typeof item === 'object' && !Array.isArray(item)
-  const rows = Array.isArray(value) ? (value.every(record) ? value : value.map((item, index) => ({ index, value: item })))
-    : record(value) ? [value] : [{ value }]
-  if (rows.length > maxRows) fail('upload_row_limit', 'JSON行数が上限を超えています。')
-  return rows
-}
 parentPort.on('message', ({ text, format, limits }) => {
   try {
-    let rows
+    let values
     if (format === 'json') {
       let parsed
       try { parsed = JSON.parse(text) } catch { fail('upload_json_invalid', 'JSONファイルを解析できません。') }
-      validateJson(parsed, limits); rows = jsonRows(parsed, limits.maxRows)
+      validateJson(parsed, limits); values = [parsed]
     } else {
       let records
       try { records = parse(text, { bom: true, columns: false, relax_column_count: false, skip_empty_lines: true,
         max_record_size: limits.maxFieldChars * limits.maxColumns, to_line: limits.maxRows + 2 }) }
       catch { fail('upload_csv_invalid', 'CSVファイルを安全に解析できません。') }
       if (records.length < 1) fail('upload_csv_empty', 'CSVにheaderがありません。')
-      const [headers, ...values] = records
+      const [headers, ...csvRows] = records
       if (!headers || !headers.length || headers.length > limits.maxColumns || new Set(headers).size !== headers.length)
         fail('upload_csv_header_invalid', 'CSV headerが空、重複、または列数上限超過です。')
       if (headers.some((header) => !header || header.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(header)))
         fail('upload_csv_header_invalid', 'CSV headerに許可されない値があります。')
-      if (values.length > limits.maxRows) fail('upload_row_limit', 'CSV行数が上限を超えています。')
-      rows = values.map((record) => Object.fromEntries(headers.map((header, index) => {
+      if (csvRows.length > limits.maxRows) fail('upload_row_limit', 'CSV行数が上限を超えています。')
+      values = csvRows.map((record) => Object.fromEntries(headers.map((header, index) => {
         const value = record[index] || ''
         if (value.length > limits.maxFieldChars) fail('upload_field_limit', 'CSV fieldが上限を超えています。')
         return [header, value]
       })))
     }
-    parentPort.postMessage({ ok: true, rows }); parentPort.close()
+    parentPort.postMessage({ ok: true, values }); parentPort.close()
   } catch (error) {
     parentPort.postMessage({ ok: false, code: error.code || 'upload_parse_failed', message: error.message }); parentPort.close()
   }
 })
 `
 
-export function parseUploadInWorker(text: string, format: 'json' | 'csv', limits: UploadLimits): Promise<TableRow[]> {
+export function parseUploadInWorker(text: string, format: 'json', limits: UploadLimits): Promise<JsonValue[]>
+export function parseUploadInWorker(text: string, format: 'csv', limits: UploadLimits): Promise<TableRow[]>
+export function parseUploadInWorker(text: string, format: 'json' | 'csv', limits: UploadLimits): Promise<JsonValue[] | TableRow[]> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(workerSource, { eval: true,
       resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16, stackSizeMb: 4 } })
@@ -76,8 +71,8 @@ export function parseUploadInWorker(text: string, format: 'json' | 'csv', limits
       void worker.terminate()
       finish(() => reject(new AppError('upload_parse_timeout', 408, 'ファイル解析時間が上限を超えました。')))
     }, limits.maxParseMs)
-    worker.once('message', (result: { ok: boolean; rows?: TableRow[]; code?: string; message?: string }) => finish(() => {
-      if (result.ok && result.rows) resolve(result.rows)
+    worker.once('message', (result: { ok: boolean; values?: JsonValue[] | TableRow[]; code?: string; message?: string }) => finish(() => {
+      if (result.ok && result.values) resolve(result.values)
       else reject(new AppError(result.code ?? 'upload_parse_failed', 400, result.message ?? 'ファイルを解析できません。'))
     }))
     worker.once('error', () => finish(() => reject(new AppError('upload_memory_limit', 413, 'ファイル解析のメモリ上限を超えました。'))))

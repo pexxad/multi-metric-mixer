@@ -1,20 +1,26 @@
 import { randomUUID } from 'node:crypto'
 import { AppError } from '../shared/errors'
 import type { RequestContext } from '../shared/request-context'
-import type { BackendCapabilityIssuer } from '../shared/backend-capability'
-import { contentHash } from '../shared/canonical-hash'
+import type { BackendAccessTokenIssuer } from '../shared/backend-access-token'
 
 type InternalMcpClientOptions = {
   url: URL
   origin: string
-  capabilities: BackendCapabilityIssuer
+  accessTokens: BackendAccessTokenIssuer
   fetch?: typeof fetch
 }
 
 function responsePayload(text: string): unknown {
   const event = text.split('\n').find((line) => line.startsWith('data: '))?.slice(6)
-  const parsed = JSON.parse(event ?? text) as { result?: { structuredContent?: unknown; content?: Array<{ text?: string }> }; error?: { message?: string } }
+  const parsed = JSON.parse(event ?? text) as {
+    result?: { structuredContent?: unknown; content?: Array<{ text?: string }>; isError?: boolean }
+    error?: { message?: string }
+  }
   if (parsed.error) throw new AppError('mcp_protocol_error', 502, parsed.error.message ?? 'MCP tool callに失敗しました。')
+  if (parsed.result?.isError) {
+    const message = parsed.result.content?.find((item) => item.text)?.text
+    throw new AppError('mcp_tool_error', 502, message ?? 'MCP toolの実行に失敗しました。')
+  }
   if (parsed.result?.structuredContent !== undefined) return parsed.result.structuredContent
   const fallback = parsed.result?.content?.[0]?.text
   return fallback ? JSON.parse(fallback) : undefined
@@ -35,19 +41,14 @@ export class InternalMcpClient {
   async call<T>(context: RequestContext, tool: string, input: Record<string, unknown>, workflowContentHash?: string, approvalId?: string): Promise<T> {
     const invocationContext = { ...context, requestId: `${context.requestId}.${randomUUID()}` }
     const body = { jsonrpc: '2.0', id: invocationContext.requestId, method: 'tools/call', params: { name: tool, arguments: input } }
-    const capability = this.options.capabilities.issue(invocationContext, {
-      action: tool,
-      inputHash: contentHash(body),
-      scopes: ['backend:mcp', `tool:${tool}`],
-      workflowContentHash,
-      approvalId,
-    })
+    const accessToken = await this.options.accessTokens.issue(invocationContext, ['backend:mcp'])
     const response = await this.fetcher(this.options.url, {
       method: 'POST',
       headers: {
         Host: this.options.url.host,
         Origin: this.options.origin,
-        Authorization: `Bearer ${capability}`,
+        Authorization: `Bearer ${accessToken}`,
+        'X-Request-Id': invocationContext.requestId,
         Accept: 'application/json, text/event-stream',
         'Content-Type': 'application/json',
         ...(workflowContentHash ? { 'X-Workflow-Content-Hash': workflowContentHash } : {}),

@@ -38,7 +38,7 @@ describe('EC2 deployment policy', () => {
     for (const denied of ['dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem', 'logs:PutLogEvents', 'logs:PutRetentionPolicy']) {
       expect(policy).not.toContain(denied)
     }
-    expect(policy).toContain('multi-metric-mixer/production/data-sources/*')
+    expect(policy).not.toContain('multi-metric-mixer/production/data-sources/')
   })
 
   it('keeps the local Keycloak and databases loopback-only and independent from production auth', async () => {

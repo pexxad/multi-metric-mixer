@@ -12,7 +12,7 @@ import { InternalBackendApiClient } from './internal-backend-api-client'
 import { openBffStorage } from './persistence/bff-storage'
 import { AgentService, DisabledAgentModel } from './agent/agent-service'
 import { OpenAiCompatibleAgentModel } from './agent/openai-compatible-provider'
-import { BackendCapabilityIssuer } from '../shared/backend-capability'
+import { BackendAccessTokenIssuer } from '../shared/backend-access-token'
 
 export type BffServices = Awaited<ReturnType<typeof createBffServices>>
 
@@ -30,7 +30,7 @@ export async function createBffServices(config: RuntimeConfig, options: { backen
   })])
   const auth = new AuthenticationService(providers, sessions,
     new AuthTransactionStore(database, config.auth.transactionSecret), identities)
-  const capabilities = new BackendCapabilityIssuer({
+  const accessTokens = new BackendAccessTokenIssuer({
     issuer: config.backendServer.tokenIssuer,
     audience: config.backendServer.audience,
     keyId: config.backendServer.tokenKeyId,
@@ -41,13 +41,13 @@ export async function createBffServices(config: RuntimeConfig, options: { backen
   const backend = new InternalBackendApiClient({
     url: backendUrl,
     origin: config.backendServer.origin,
-    capabilities,
+    accessTokens,
     fetch: options.backendFetch,
   })
   const mcp = new InternalMcpClient({
     url: new URL('/mcp', backendUrl),
     origin: config.backendServer.origin,
-    capabilities,
+    accessTokens,
     fetch: options.backendFetch,
   })
   const conversations = new ConversationRepository(database)
@@ -55,6 +55,7 @@ export async function createBffServices(config: RuntimeConfig, options: { backen
     ? new OpenAiCompatibleAgentModel({ baseUrl: new URL(config.agent.baseUrl), model: config.agent.model,
       apiKey: config.agent.apiKey, timeoutMs: config.agent.timeoutMs, maxTokens: config.agent.maxTokens,
       contextWindowTokens: config.agent.contextWindowTokens,
+      reasoningEffort: config.agent.reasoningEffort,
       transportSecurity: config.agent.transportSecurity })
     : new DisabledAgentModel())
   const audit = new AuditRepository(database)
@@ -68,6 +69,7 @@ export async function createBffServices(config: RuntimeConfig, options: { backen
     auth,
     backend,
     sources: backend.sources,
+    connectionProfiles: backend.connectionProfiles,
     catalogs: backend.catalogs,
     artifacts: backend.artifacts,
     workflows: backend.workflows,

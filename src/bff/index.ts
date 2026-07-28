@@ -7,7 +7,14 @@ const config = loadRuntimeConfig()
 const services = await createBffServices(config)
 const app = createPublicApp({ config, services })
 const server = serve({ fetch: app.fetch, hostname: config.publicServer.hostname, port: config.publicServer.port },
-  (info) => console.log(JSON.stringify({ event: 'bff_started', address: info.address, port: info.port, release: config.release })))
+  (info) => console.log(JSON.stringify({
+    event: 'bff_started',
+    address: info.address,
+    port: info.port,
+    release: config.release,
+    agentProvider: services.agent.model.metadata.provider,
+    ...(services.agent.model.metadata.model ? { agentModel: services.agent.model.metadata.model } : {}),
+  })))
 
 let shuttingDown = false
 function shutdown(signal: string) {

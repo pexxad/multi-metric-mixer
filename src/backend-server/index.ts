@@ -1,11 +1,11 @@
 import { serve } from '@hono/node-server'
-import { createBackendCore } from '../backend-core/runtime'
 import { loadBackendRuntimeConfig } from './config'
 import { createBackendApp } from './app'
+import { createBackendServerServices } from './runtime'
 
 const config = loadBackendRuntimeConfig()
-const core = await createBackendCore(config)
-const app = createBackendApp(config, core)
+const services = await createBackendServerServices(config)
+const app = createBackendApp(config, services)
 
 const server = serve({
   fetch: app.fetch,
@@ -21,7 +21,7 @@ function shutdown(signal: string) {
   if (shuttingDown) return
   shuttingDown = true
   console.log(JSON.stringify({ event: 'backend_shutdown_started', signal }))
-  server.close(() => { void core.close().finally(() => process.exit(0)) })
+  server.close(() => { void services.close().finally(() => process.exit(0)) })
   setTimeout(() => process.exit(1), 10_000).unref()
 }
 process.on('SIGINT', () => shutdown('SIGINT'))

@@ -17,10 +17,35 @@ export class DataSourceReadService {
   }
 
   async query(context: RequestContext, config: QueryStep['config'], runId?: string): Promise<StoredArtifact> {
-    const source = await this.sources.get(context, config.source)
+    const source = config.template
+      ? await this.sources.getVersion?.(context, config.source, config.template.sourceVersion)
+      : await this.sources.get(context, config.source)
     if (!source) throw new AppError('source_not_found', 404, `データソース「${config.source}」は登録されていません。`)
+    if (source.type === 'cloudwatch-logs') {
+      if (source.queryMode === 'template-required' && !config.template) {
+        throw new AppError('query_template_required', 400, 'このデータソースは検索パターンの選択が必要です。')
+      }
+      if (config.template && !source.queryTemplates.some((template) => template.id === config.template!.id)) {
+        throw new AppError('query_template_not_found', 400, '指定された検索パターンまたはバージョンが見つかりません。')
+      }
+    } else if (config.template) {
+      throw new AppError('query_template_unsupported', 400, 'このデータソースは検索パターンに対応していません。')
+    }
     const connector = this.connectors.get(source.type)
     if (!connector) throw new AppError('source_connector_unavailable', 503, `データソース「${source.type}」のreaderが構成されていません。`)
     return connector.read(context, source, config, runId)
+  }
+
+  async sample(context: RequestContext, sourceId: string, requestedLimit: number): Promise<StoredArtifact> {
+    const source = await this.sources.get(context, sourceId)
+    if (!source) throw new AppError('source_not_found', 404, `データソース「${sourceId}」は登録されていません。`)
+    if (source.type === 'cloudwatch-logs' && source.queryMode === 'template-required') {
+      throw new AppError('query_template_required', 400, 'このデータソースは検索パターンの選択が必要なため、無条件のサンプル取得はできません。')
+    }
+    const limit = Math.max(1, Math.min(requestedLimit, 100))
+    const parameters: Record<string, string> = source.type === 'dynamodb' ? { operation: 'Scan' }
+      : source.type === 'cloudwatch-logs' ? { query: `fields @timestamp, @message | limit ${limit}` }
+        : source.type === 'database-table' || source.type === 'database-documents' ? { limit: String(limit) } : {}
+    return this.query(context, { source: source.id, parameters, template: null })
   }
 }

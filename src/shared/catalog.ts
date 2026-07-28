@@ -9,6 +9,7 @@ export const catalogFieldSchema = z.object({
   dataTypes: z.array(catalogDataTypeSchema).min(1).max(6),
   nullable: z.boolean(),
   presence: z.number().min(0).max(1),
+  repeated: z.boolean().default(false),
   businessName: z.string().max(200).default(''),
   description: z.string().max(2_000).default(''),
   unit: z.string().max(100).default(''),
@@ -33,6 +34,7 @@ export const catalogDefinitionSchema = z.object({
   description: z.string().max(2_000).default(''),
   policy: catalogPolicySchema.default('hybrid'),
   classification: catalogClassificationSchema.default('internal'),
+  dataModel: z.enum(['table', 'documents']).default('documents'),
   defaultTimeField: z.string().max(512).nullable().default(null),
   fields: z.array(catalogFieldSchema).max(500),
   relationships: z.array(catalogRelationshipSchema).max(100).default([]),
@@ -44,6 +46,7 @@ export const catalogObservationSchema = z.object({
   rowCount: z.number().int().nonnegative(),
   sampledRows: z.number().int().nonnegative().max(500),
   schemaFingerprint: z.string().min(1),
+  dataModel: z.enum(['table', 'documents']).default('documents'),
   fields: z.array(catalogFieldSchema).max(500),
 }).strict()
 
