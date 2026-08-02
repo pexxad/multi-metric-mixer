@@ -86,6 +86,35 @@ describe('OpenAI-compatible agent provider', () => {
     expect(body).not.toHaveProperty('reasoning_effort')
   })
 
+  it('streams bounded generation metrics without exposing reasoning text', async () => {
+    const wire = JSON.stringify({ state: 'answer', message: '回答します。', changes: [], questions: [], sourceIds: [],
+      limit: 0, reason: 'answer', ...unusedToolFields })
+    const midpoint = Math.ceil(wire.length / 2)
+    const body = [
+      `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: '内部推論' }, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { content: wire.slice(0, midpoint) }, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { content: wire.slice(midpoint) }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 20, completion_tokens: 12, total_tokens: 32 } })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join('')
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(body, {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    }))
+    const provider = new OpenAiCompatibleAgentModel({ baseUrl: new URL('https://models.example.com/v1/'),
+      model: 'local-model', timeoutMs: 5_000, maxTokens: 4_096, contextWindowTokens: 32_768 }, fetchMock)
+    const activities: Array<Record<string, unknown>> = []
+
+    await expect(provider.respond({ message: 'test', workflow: sampleWorkflow,
+      workflowExecution: unavailableWorkflowExecution, dataSources: [], catalogs: [], history: [] },
+    (activity) => { activities.push(activity) })).resolves.toMatchObject({ state: 'answer', message: '回答します。' })
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toMatchObject({ stream: true })
+    expect(activities[0]).toMatchObject({ kind: 'generation', status: 'running', generatedTokens: 0 })
+    expect(activities.at(-1)).toMatchObject({ kind: 'generation', status: 'completed', generatedTokens: 12,
+      tokenCount: 'reported', reasoningCharacters: 4, finishReason: 'stop' })
+    expect(JSON.stringify(activities)).not.toContain('内部推論')
+  })
+
   it('puts the latest user request after application context and conversation history', async () => {
     const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
       state: 'answer', message: 'local-salesの項目を説明します。', changes: [], questions: [], sourceIds: [], limit: 0,
@@ -302,6 +331,43 @@ describe('OpenAI-compatible agent provider', () => {
     await expect(provider.respond({ message: 'test', workflow: sampleWorkflow, workflowExecution: unavailableWorkflowExecution,
       dataSources: [], catalogs: [], history: [] }))
       .rejects.toMatchObject({ code: 'agent_invalid_response', status: 502 })
+  })
+
+  it('attaches a sanitized final provider response to invalid-response diagnostics', async () => {
+    const provider = new OpenAiCompatibleAgentModel({ baseUrl: new URL('https://models.example.com/v1/'),
+      model: 'local-model', timeoutMs: 5_000, maxTokens: 4_096, contextWindowTokens: 32_768 },
+    async () => new Response(JSON.stringify({ choices: [{ message: {
+      content: 'not-json', reasoning_content: 'hidden chain of thought',
+    }, finish_reason: 'stop' }], usage: { completion_tokens: 9 } }), { status: 200 }))
+
+    let caught: unknown
+    try {
+      await provider.respond({ message: 'test', workflow: sampleWorkflow, workflowExecution: unavailableWorkflowExecution,
+        dataSources: [], catalogs: [], history: [] })
+    } catch (error) { caught = error }
+
+    expect(caught).toMatchObject({ code: 'agent_invalid_response', details: { providerResponse: {
+      finishReason: 'stop', contentPreview: 'not-json', reasoningCharacters: 23,
+      usage: { completionTokens: 9 },
+    } } })
+    expect(JSON.stringify(caught)).not.toContain('hidden chain of thought')
+  })
+
+  it('redacts secrets and reasoning from an upstream error body', async () => {
+    const provider = new OpenAiCompatibleAgentModel({ baseUrl: new URL('https://models.example.com/v1/'),
+      model: 'local-model', timeoutMs: 5_000, maxTokens: 4_096, contextWindowTokens: 32_768 },
+    async () => Response.json({ error: 'invalid request', reasoning_content: 'private reasoning', api_key: 'secret-key' }, { status: 400 }))
+
+    let caught: unknown
+    try {
+      await provider.respond({ message: 'test', workflow: sampleWorkflow, workflowExecution: unavailableWorkflowExecution,
+        dataSources: [], catalogs: [], history: [] })
+    } catch (error) { caught = error }
+
+    expect(caught).toMatchObject({ code: 'agent_provider_error', details: { upstreamStatus: 400,
+      providerResponse: { body: { error: 'invalid request', reasoning_content: '[redacted]', api_key: '[redacted]' } } } })
+    expect(JSON.stringify(caught)).not.toContain('private reasoning')
+    expect(JSON.stringify(caught)).not.toContain('secret-key')
   })
 
   it('reports an explicit error when a reasoning model consumes the output budget before emitting JSON', async () => {

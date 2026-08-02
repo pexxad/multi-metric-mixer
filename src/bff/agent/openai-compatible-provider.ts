@@ -1,6 +1,8 @@
 import { z } from 'zod'
+import { randomUUID } from 'node:crypto'
 import { AppError } from '../../shared/errors'
 import { validateWorkflow } from '../../shared/workflow-validation'
+import type { AgentGenerationActivity } from '../../shared/api'
 import { agentAnswerWireSchema, agentDecisionWireSchema, agentProposalResponseSchema, parseAgentDecisionWire,
   type AgentModelInput, type AgentModelProvider, type AgentModelResponse } from './provider'
 
@@ -34,6 +36,120 @@ const completionSchema = z.object({
     finish_reason: z.string().nullable().optional(),
   }).passthrough()).min(1),
 }).passthrough()
+
+type Completion = z.infer<typeof completionSchema>
+type GenerationListener = (activity: AgentGenerationActivity) => void | Promise<void>
+
+function generatedTokenEstimate(content: string, reasoning: string): number {
+  return Math.ceil(new TextEncoder().encode(content + reasoning).byteLength / 3)
+}
+
+function responseDiagnostic(completion: unknown, upstreamStatus = 200): Record<string, unknown> {
+  if (!completion || typeof completion !== 'object' || Array.isArray(completion)) return { upstreamStatus }
+  const record = completion as Record<string, unknown>
+  const choice = Array.isArray(record.choices) && record.choices[0] && typeof record.choices[0] === 'object'
+    ? record.choices[0] as Record<string, unknown> : undefined
+  const message = choice?.message && typeof choice.message === 'object' && !Array.isArray(choice.message)
+    ? choice.message as Record<string, unknown> : undefined
+  const content = typeof message?.content === 'string' ? message.content : ''
+  const reasoning = typeof message?.reasoning_content === 'string' ? message.reasoning_content : ''
+  const usage = record.usage && typeof record.usage === 'object' && !Array.isArray(record.usage)
+    ? record.usage as Record<string, unknown> : undefined
+  return {
+    upstreamStatus,
+    finishReason: typeof choice?.finish_reason === 'string' ? choice.finish_reason : null,
+    contentCharacters: content.length,
+    ...(content ? { contentPreview: content.slice(0, 4_000), contentTruncated: content.length > 4_000 } : {}),
+    reasoningCharacters: reasoning.length,
+    usage: usage ? {
+      promptTokens: typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : null,
+      completionTokens: typeof usage.completion_tokens === 'number' ? usage.completion_tokens : null,
+      totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : null,
+    } : null,
+  }
+}
+
+function sanitizedProviderError(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') return value
+  if (typeof value === 'string') return value.slice(0, 4_000)
+  if (depth >= 4) return '[nested value omitted]'
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => sanitizedProviderError(item, depth + 1))
+  if (!value || typeof value !== 'object') return String(value).slice(0, 4_000)
+  return Object.fromEntries(Object.entries(value).slice(0, 30).map(([key, item]) => {
+    const sensitive = /^(reasoning|reasoning_content|chain_of_thought|authorization|api[_-]?key|access[_-]?token|secret)$/i.test(key)
+    return [key.slice(0, 128), sensitive ? '[redacted]' : sanitizedProviderError(item, depth + 1)]
+  }))
+}
+
+function providerErrorDiagnostic(body: string): unknown {
+  try { return sanitizedProviderError(JSON.parse(body)) }
+  catch { return body.replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]').slice(0, 4_000) }
+}
+
+async function streamedCompletion(response: Response, id: string, startedAt: number,
+  onGeneration?: GenerationListener): Promise<Completion> {
+  if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
+    const value = await response.json() as unknown
+    const completion = completionSchema.parse(value)
+    const diagnostic = responseDiagnostic(completion)
+    const usage = completion as Completion & { usage?: { completion_tokens?: number } }
+    const choice = completion.choices[0]!
+    const reasoning = typeof choice.message.reasoning_content === 'string' ? choice.message.reasoning_content : ''
+    await onGeneration?.({ kind: 'generation', id, status: 'completed',
+      generatedTokens: usage.usage?.completion_tokens ?? generatedTokenEstimate(choice.message.content ?? '', reasoning),
+      tokenCount: typeof usage.usage?.completion_tokens === 'number' ? 'reported' : 'estimated',
+      contentCharacters: Number(diagnostic.contentCharacters), reasoningCharacters: Number(diagnostic.reasoningCharacters),
+      elapsedMs: Math.round(performance.now() - startedAt), finishReason: choice.finish_reason ?? null })
+    return completion
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let content = ''
+  let reasoning = ''
+  let finishReason: string | null = null
+  let usage: Record<string, unknown> | undefined
+  let lastPublishedAt = startedAt
+  let lastPublishedTokens = 0
+  const publish = async (status: 'running' | 'completed') => {
+    const reported = typeof usage?.completion_tokens === 'number' ? usage.completion_tokens : undefined
+    const generatedTokens = reported ?? generatedTokenEstimate(content, reasoning)
+    const now = performance.now()
+    if (status === 'running' && generatedTokens - lastPublishedTokens < 8 && now - lastPublishedAt < 100) return
+    lastPublishedAt = now
+    lastPublishedTokens = generatedTokens
+    await onGeneration?.({ kind: 'generation', id, status, generatedTokens,
+      tokenCount: reported === undefined ? 'estimated' : 'reported', contentCharacters: content.length,
+      reasoningCharacters: reasoning.length, elapsedMs: Math.round(now - startedAt), finishReason })
+  }
+  for (;;) {
+    const chunk = await reader.read()
+    buffer += decoder.decode(chunk.value, { stream: !chunk.done }).replaceAll('\r\n', '\n')
+    if (chunk.done && buffer.trim()) buffer += '\n\n'
+    const events = buffer.split('\n\n')
+    buffer = events.pop() ?? ''
+    for (const event of events) {
+      const data = event.split('\n').filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trim()).join('\n')
+      if (!data || data === '[DONE]') continue
+      const value = JSON.parse(data) as Record<string, unknown>
+      if (value.usage && typeof value.usage === 'object' && !Array.isArray(value.usage)) usage = value.usage as Record<string, unknown>
+      const choice = Array.isArray(value.choices) && value.choices[0] && typeof value.choices[0] === 'object'
+        ? value.choices[0] as Record<string, unknown> : undefined
+      const delta = choice?.delta && typeof choice.delta === 'object' && !Array.isArray(choice.delta)
+        ? choice.delta as Record<string, unknown> : undefined
+      if (typeof delta?.content === 'string') content += delta.content
+      if (typeof delta?.reasoning_content === 'string') reasoning += delta.reasoning_content
+      if (typeof choice?.finish_reason === 'string') finishReason = choice.finish_reason
+      await publish('running')
+    }
+    if (chunk.done) break
+  }
+  await publish('completed')
+  return completionSchema.parse({ choices: [{ message: { content, ...(reasoning ? { reasoning_content: reasoning } : {}) },
+    finish_reason: finishReason }], ...(usage ? { usage } : {}) })
+}
 
 const SYSTEM_PROMPT = `あなたはMulti Metric Mixerの分析計画エージェントです。
 利用者の目的を、提供された読み取り専用データソースだけを使う宣言的Workflowへ変換してください。
@@ -113,7 +229,7 @@ export class OpenAiCompatibleAgentModel implements AgentModelProvider {
       ...(config.transportSecurity ? { transportSecurity: config.transportSecurity } : {}) }
   }
 
-  async respond(input: AgentModelInput): Promise<AgentModelResponse> {
+  async respond(input: AgentModelInput, onGeneration?: GenerationListener): Promise<AgentModelResponse> {
     const workflowExecutionCompleted = input.toolResults?.some((item) =>
       item.tool === 'workflow_execute' && item.result !== undefined && item.error === undefined) ?? false
     const applicationContext = {
@@ -158,7 +274,8 @@ export class OpenAiCompatibleAgentModel implements AgentModelProvider {
     let decision
     try {
       decision = parseAgentDecisionWire(await this.complete(messages, decisionSchema,
-        workflowExecutionCompleted ? 'multi_metric_mixer_workflow_result' : 'multi_metric_mixer_agent_decision'))
+        workflowExecutionCompleted ? 'multi_metric_mixer_workflow_result' : 'multi_metric_mixer_agent_decision',
+        (value) => value, onGeneration))
     } catch (error) {
       if (error instanceof AppError) throw error
       if (error instanceof z.ZodError) throw new AppError('agent_invalid_response', 502,
@@ -175,7 +292,7 @@ export class OpenAiCompatibleAgentModel implements AgentModelProvider {
       const proposal = await this.complete([
         ...proposalMessages,
         ...(repair ? [{ role: 'user', content: '直前の構造化応答はWorkflow Schemaまたは接続関係の検証に失敗しました。依頼内容は変えず、全stepとplanを欠落なく作り直してください。' }] : []),
-      ], agentProposalResponseSchema, 'multi_metric_mixer_agent_proposal', normalizeProposalPresentation)
+      ], agentProposalResponseSchema, 'multi_metric_mixer_agent_proposal', normalizeProposalPresentation, onGeneration)
       const validation = validateWorkflow(proposal.workflow)
       if (!validation.valid) throw new AppError('agent_invalid_response', 502,
         '分析エージェントの応答をWorkflowとして処理できませんでした。再度お試しください。', validation.errors, true)
@@ -190,14 +307,19 @@ export class OpenAiCompatibleAgentModel implements AgentModelProvider {
   }
 
   private async complete<T>(messages: Array<{ role: string; content: string }>, schema: z.ZodType<T>, schemaName: string,
-    normalize: (value: unknown) => unknown = (value) => value): Promise<T> {
+    normalize: (value: unknown) => unknown = (value) => value, onGeneration?: GenerationListener): Promise<T> {
     if (estimatedMessageTokens(messages) > this.config.contextWindowTokens - this.config.maxTokens) {
       throw new AppError('agent_context_limit', 413,
         '会話、Workflow、Data Catalogが長すぎます。新しい会話に分けて再度お試しください。')
     }
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs)
+    const generationId = randomUUID()
+    const startedAt = performance.now()
+    let diagnostic: Record<string, unknown> | undefined
     try {
+      await onGeneration?.({ kind: 'generation', id: generationId, status: 'running', generatedTokens: 0,
+        tokenCount: 'estimated', contentCharacters: 0, reasoningCharacters: 0, elapsedMs: 0 })
       const response = await this.fetchImplementation(new URL('chat/completions', ensureTrailingSlash(this.config.baseUrl)), {
         method: 'POST',
         signal: controller.signal,
@@ -209,6 +331,7 @@ export class OpenAiCompatibleAgentModel implements AgentModelProvider {
           model: this.config.model,
           temperature: 0.1,
           max_tokens: this.config.maxTokens,
+          stream: true,
           ...(this.config.reasoningEffort ? { reasoning_effort: this.config.reasoningEffort } : {}),
           messages,
           response_format: {
@@ -217,18 +340,27 @@ export class OpenAiCompatibleAgentModel implements AgentModelProvider {
           },
         }),
       })
-      if (!response.ok) throw new AppError('agent_provider_error', 502,
-        '分析エージェントで一時的なエラーが発生しました。再度お試しください。', { upstreamStatus: response.status }, true)
-      const completion = completionSchema.parse(await response.json())
+      if (!response.ok) {
+        const body = await response.text().catch(() => '')
+        throw new AppError('agent_provider_error', 502,
+          '分析エージェントで一時的なエラーが発生しました。再度お試しください。', {
+            upstreamStatus: response.status,
+            ...(body ? { providerResponse: { body: providerErrorDiagnostic(body), bodyTruncated: body.length > 4_000 } } : {}),
+          }, true)
+      }
+      const completion = await streamedCompletion(response, generationId, startedAt, onGeneration)
+      diagnostic = responseDiagnostic(completion, response.status)
       const choice = completion.choices[0]!
       if (!choice.message.content && choice.finish_reason === 'length') {
         throw new AppError('agent_provider_output_limit', 502,
-          '分析エージェントの応答が長すぎました。依頼を分けて再度お試しください。', undefined, true)
+          '分析エージェントの応答が長すぎました。依頼を分けて再度お試しください。',
+          { providerResponse: diagnostic }, true)
       }
       let decoded: unknown
       try { decoded = JSON.parse(choice.message.content ?? '') }
       catch { throw new AppError('agent_invalid_response', 502,
-        '分析エージェントの応答を処理できませんでした。再度お試しください。', undefined, true) }
+        '分析エージェントの応答を処理できませんでした。再度お試しください。',
+        { providerResponse: diagnostic }, true) }
       return schema.parse(normalize(decoded))
     } catch (error) {
       if (error instanceof AppError) throw error
@@ -238,7 +370,8 @@ export class OpenAiCompatibleAgentModel implements AgentModelProvider {
       }
       if (error instanceof z.ZodError) {
         throw new AppError('agent_invalid_response', 502,
-          '分析エージェントの応答をWorkflowとして処理できませんでした。再度お試しください。', error.issues, true)
+          '分析エージェントの応答をWorkflowとして処理できませんでした。再度お試しください。',
+          { validationErrors: error.issues, ...(diagnostic ? { providerResponse: diagnostic } : {}) }, true)
       }
       throw new AppError('agent_provider_unreachable', 503,
         '分析エージェントへ接続できません。時間をおいて再度お試しください。', undefined, true)

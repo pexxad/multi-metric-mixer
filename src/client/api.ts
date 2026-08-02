@@ -1,4 +1,4 @@
-import type { AgentResponse, AgentToolActivity } from '../shared/api'
+import type { AgentResponse, AgentStreamActivity } from '../shared/api'
 import type { Workflow, WorkflowRun } from '../shared/workflow'
 import type { CatalogBundle, CatalogDefinition, CatalogVersion } from '../shared/catalog'
 import type { DataSource as StoredDataSource, DataSourceCapability, DataSourceRegistration } from '../shared/data-source'
@@ -37,7 +37,14 @@ export type Bootstrap = {
 }
 export type RunRecord = { id: string; workflowId: string; workflowVersion: number; status: string; startedAt: string; finishedAt?: string; summary: unknown }
 
-type Problem = { title?: string; detail?: string; code?: string; errors?: unknown }
+export type Problem = { title?: string; detail?: string; code?: string; requestId?: string; errors?: unknown }
+
+export class ApiProblemError extends Error {
+  constructor(readonly problem: Problem, fallback: string) {
+    super(problemMessage(problem, fallback))
+    this.name = 'ApiProblemError'
+  }
+}
 
 function problemMessage(problem: Problem, fallback: string): string {
   const summary = problem.detail ?? problem.title ?? problem.code ?? fallback
@@ -51,7 +58,8 @@ async function parse<T>(response: Response): Promise<T> {
   const body = await response.json().catch(() => undefined) as T | Problem | undefined
   if (!response.ok) {
     const problem = body as Problem | undefined
-    throw new Error(problem ? problemMessage(problem, `HTTP ${response.status}`) : `HTTP ${response.status}`)
+    if (problem) throw new ApiProblemError(problem, `HTTP ${response.status}`)
+    throw new Error(`HTTP ${response.status}`)
   }
   return body as T
 }
@@ -131,7 +139,7 @@ export function respondToAgent(session: AuthSession, input: {
   workflow: Workflow
   conversationId?: string
   clientMessageId: string
-}, onActivity?: (activity: AgentToolActivity) => void): Promise<AgentResponse> {
+}, onActivity?: (activity: AgentStreamActivity) => void): Promise<AgentResponse> {
   if (!onActivity) return mutate<AgentResponse>(session, '/api/agent/respond', 'POST', input)
   return fetch('/api/agent/respond/stream', {
     method: 'POST',
@@ -154,12 +162,12 @@ export function respondToAgent(session: AuthSession, input: {
         const eventName = event.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim()
         const data = event.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
         if (!data) continue
-        const value = JSON.parse(data) as AgentToolActivity | AgentResponse | Problem
-        if (eventName === 'activity') onActivity(value as AgentToolActivity)
+        const value = JSON.parse(data) as AgentStreamActivity | AgentResponse | Problem
+        if (eventName === 'activity') onActivity(value as AgentStreamActivity)
         else if (eventName === 'response') result = value as AgentResponse
         else if (eventName === 'error') {
           const problem = value as Problem
-          throw new Error(problemMessage(problem, '分析エージェントの処理に失敗しました。'))
+          throw new ApiProblemError(problem, '分析エージェントの処理に失敗しました。')
         }
       }
       if (chunk.done) break

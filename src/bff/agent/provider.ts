@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { workflowSchema } from '../../shared/workflow'
 import type { CatalogDefinition } from '../../shared/catalog'
+import type { AgentGenerationActivity } from '../../shared/api'
 
 const questionSchema = z.object({
   id: z.string().min(1).max(64),
@@ -208,5 +209,5 @@ export type AgentModelMetadata = {
 
 export interface AgentModelProvider {
   readonly metadata: AgentModelMetadata
-  respond(input: AgentModelInput): Promise<AgentModelResponse>
+  respond(input: AgentModelInput, onGeneration?: (activity: AgentGenerationActivity) => void | Promise<void>): Promise<AgentModelResponse>
 }

@@ -5,8 +5,10 @@ import {
   Check,
   CircleAlert,
   Clock3,
+  Bug,
   Database,
   GitBranch,
+  Gauge,
   LoaderCircle,
   MessageSquarePlus,
   Play,
@@ -16,7 +18,7 @@ import {
   Workflow as WorkflowIcon,
   X,
 } from 'lucide-react'
-import type { AgentResponse, AgentToolActivity, AgentWorkflowRun } from '../shared/api'
+import type { AgentGenerationActivity, AgentResponse, AgentToolActivity, AgentWorkflowRun } from '../shared/api'
 import type { ArtifactSummary, Workflow, WorkflowRun } from '../shared/workflow'
 import type { DataSource } from './api'
 
@@ -29,6 +31,8 @@ export type ChatViewMessage = {
   text: string
   metadata?: AgentMessageMetadata
   toolCalls?: AgentToolActivity[]
+  generations?: AgentGenerationActivity[]
+  diagnostic?: { code?: string; requestId?: string; details?: unknown }
   run?: WorkflowRun
 }
 
@@ -43,6 +47,7 @@ type ChatWorkspaceProps = {
   proposal?: Extract<AgentResponse, { state: 'proposal' }>
   planning: boolean
   activeToolCalls: AgentToolActivity[]
+  activeGenerations: AgentGenerationActivity[]
   executing: boolean
   prompt: string
   onPromptChange: (value: string) => void
@@ -105,6 +110,35 @@ function ToolActivityTimeline({ activities }: { activities: AgentToolActivity[] 
           : '失敗'}</small>
     </li>)}</ol>
   </section>
+}
+
+function GenerationTimeline({ activities }: { activities: AgentGenerationActivity[] }) {
+  if (activities.length === 0) return null
+  return <section className="agent-generation-timeline" aria-label="モデル生成状況">
+    <header><Gauge size={13} /><strong>モデル生成状況</strong></header>
+    <ol>{activities.map((activity, index) => <li key={activity.id} className={activity.status}>
+      <span>{activity.status === 'running' ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</span>
+      <div><strong>生成 {index + 1}</strong><small>
+        本文 {activity.contentCharacters.toLocaleString('ja-JP')}文字
+        {activity.reasoningCharacters > 0 ? ` · 推論 ${activity.reasoningCharacters.toLocaleString('ja-JP')}文字` : ''}
+      </small></div>
+      <div><strong>{activity.tokenCount === 'estimated' ? '約' : ''}{activity.generatedTokens.toLocaleString('ja-JP')} tokens</strong>
+        <small>{activity.status === 'running' ? '生成中' : `${activity.elapsedMs.toLocaleString('ja-JP')}ms`}</small></div>
+    </li>)}</ol>
+  </section>
+}
+
+function ErrorDiagnostics({ diagnostic }: { diagnostic?: ChatViewMessage['diagnostic'] }) {
+  if (!diagnostic || (!diagnostic.code && !diagnostic.requestId && diagnostic.details === undefined)) return null
+  return <details className="agent-error-diagnostics">
+    <summary><Bug size={13} />エラー詳細を表示</summary>
+    <pre>{JSON.stringify({
+      ...(diagnostic.code ? { code: diagnostic.code } : {}),
+      ...(diagnostic.requestId ? { requestId: diagnostic.requestId } : {}),
+      ...(diagnostic.details !== undefined ? { details: diagnostic.details } : {}),
+    }, null, 2)}</pre>
+    <p>hidden reasoning本文と認証情報は表示されません。</p>
+  </details>
 }
 
 function ArtifactPreview({ artifact, label = '取得データ' }: { artifact: ArtifactSummary; label?: string }) {
@@ -175,7 +209,9 @@ function AgentMessage({ message, onSend, onOpenWorkflow }: {
     <div>
       <header><strong>{message.role === 'agent' ? 'Mixer Agent' : message.role === 'user' ? 'あなた' : 'システム'}</strong></header>
       <p>{message.text}</p>
+      <GenerationTimeline activities={message.generations ?? []} />
       <ToolActivityTimeline activities={message.toolCalls ?? metadata?.toolCalls ?? []} />
+      <ErrorDiagnostics diagnostic={message.diagnostic} />
       {metadata?.state === 'answer' && metadata.catalogs.map((catalog) => <section
         className="chat-catalog" aria-label={`${catalog.displayName}のData Catalog`} key={`${catalog.sourceId}:${catalog.scope}:${catalog.version}`}>
         <header>
@@ -255,6 +291,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
 
         {props.planning && <article className="chat-message-card agent pending"><span className="chat-message-avatar"><Sparkles size={15} /></span>
           <div><header><strong>Mixer Agent</strong></header><p><LoaderCircle className="spin" size={14} /> 分析手順を確認しています…</p>
+            <GenerationTimeline activities={props.activeGenerations} />
             <ToolActivityTimeline activities={props.activeToolCalls} /></div></article>}
 
         {props.proposal && <section className="analysis-plan-card" aria-label="Workflowへの変更案">

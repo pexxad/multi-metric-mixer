@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { AppError } from '../../shared/errors'
-import type { AgentResponse, AgentToolActivity, AgentWorkflowRun } from '../../shared/api'
+import type { AgentResponse, AgentStreamActivity, AgentWorkflowRun } from '../../shared/api'
 import type { CatalogBundle, CatalogObservation, CatalogVersion } from '../../shared/catalog'
 import type { RequestContext } from '../../shared/request-context'
 import { canRun } from '../../shared/request-context'
@@ -88,7 +88,7 @@ export async function orchestrateAgentRequest(
   services: BffServices,
   context: RequestContext,
   input: AgentRequest,
-  onActivity?: (activity: AgentToolActivity) => void | Promise<void>,
+  onActivity?: (activity: AgentStreamActivity) => void | Promise<void>,
 ): Promise<AgentResponse> {
   const [conversation, sources, catalogs, workflowVersions] = await Promise.all([
     input.conversationId ? services.conversations.require(context, input.conversationId) : Promise.resolve(undefined),
@@ -114,7 +114,8 @@ export async function orchestrateAgentRequest(
           ? { reason: `現在のWorkflowは設定が不足しています: ${matchingWorkflow.validation.errors.join(' ')}` }
           : {}),
   }
-  const runner = new AgentMcpRunner(services.mcp, context, onActivity)
+  const runner = new AgentMcpRunner(services.mcp, context, (activity) => onActivity?.(activity))
+  const respond = (modelInput: Parameters<typeof services.agent.respond>[0]) => services.agent.respond(modelInput, onActivity)
   const { history, priorResults } = conversationContext(conversation?.messages ?? [])
   let availableCatalogs = catalogs
   const currentTurnEvents: NonNullable<Parameters<typeof services.agent.respond>[0]['currentTurn']>['events'] = []
@@ -160,7 +161,7 @@ export async function orchestrateAgentRequest(
           input: call.input,
           error: '同じMCPツールと入力は今回の依頼ですでに実行済みです。既存のresultを使用し、別のtoolまたは最終回答を選択してください。',
         })
-        decision = await services.agent.respond(modelInput())
+        decision = await respond(modelInput())
         continue
       }
       seenToolCalls.add(key)
@@ -181,11 +182,11 @@ export async function orchestrateAgentRequest(
         item.error = error.message
       }
       toolResults.push(item)
-      decision = await services.agent.respond(modelInput())
+      decision = await respond(modelInput())
     }
     return decision
   }
-  let response = await runToolLoop(await services.agent.respond(modelInput()))
+  let response = await runToolLoop(await respond(modelInput()))
 
   if (response.state === 'exploration') {
     const allowedSources = new Map(sources.map((source) => [source.id, source]))
@@ -219,7 +220,7 @@ export async function orchestrateAgentRequest(
       sourceIds: observations.map((catalog) => catalog.sourceId),
       savedTo: 'personal-catalog',
     })
-    response = await runToolLoop(await services.agent.respond(modelInput({
+    response = await runToolLoop(await respond(modelInput({
       catalogs: catalogContext(refreshedCatalogs),
     })))
   }

@@ -1,6 +1,7 @@
 import { AppError } from '../../shared/errors'
 import { aggregateOutputColumn, validateWorkflowGraph, type WorkflowStep } from '../../shared/workflow'
 import type { AgentModelInput, AgentModelProvider, AgentModelResponse } from './provider'
+import type { AgentGenerationActivity } from '../../shared/api'
 import { validateQueryArguments } from '../../shared/query-template'
 
 export class DisabledAgentModel implements AgentModelProvider {
@@ -15,11 +16,12 @@ export class DisabledAgentModel implements AgentModelProvider {
 export class AgentService {
   constructor(readonly model: AgentModelProvider) {}
 
-  async respond(input: AgentModelInput): Promise<AgentModelResponse> {
+  async respond(input: AgentModelInput,
+    onGeneration?: (activity: AgentGenerationActivity) => void | Promise<void>): Promise<AgentModelResponse> {
     let attemptInput = input
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const response = await this.model.respond(attemptInput)
+        const response = await this.model.respond(attemptInput, onGeneration)
         if (response.state === 'proposal') validateAgentProposal(attemptInput, response)
         return response
       } catch (error) {

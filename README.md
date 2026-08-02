@@ -95,6 +95,8 @@ OpenAI互換APIが`finish_reason=stop`と推論用fieldを返していても、�
 
 `OPENAI_COMPATIBLE_REASONING_EFFORT`は、対応するmodel/APIについて推論量と応答時間のバランスを調整する任意設定です。指定できる値は`none`、`minimal`、`low`、`medium`、`high`、`xhigh`です。未設定なら`reasoning_effort`をAPIへ送らず、接続先の既定値を使います。対応値はmodelごとに異なるため、接続先が明示的に対応する値だけを指定してください。この設定は推論用fieldを最終回答へ転用するものではなく、アプリは引き続き`message.content`だけを最終回答として扱います。
 
+チャット画面はmodel応答をstreamで受け取り、生成中の出力token数、本文文字数、推論文字数、経過時間を「モデル生成状況」に表示します。providerがstream中のusageを返さない場合、token数には「約」を付けてUTF-8 byte数からの推定値を表示します。Agent応答が不正な場合は、error code、request ID、`finish_reason`、usage、最終`message.content`の最大4,000文字を「エラー詳細を表示」から確認できます。`reasoning_content`本文、credential、request header、tool引数はBrowserへ返しません。
+
 ## 外部OIDC Providerで開発する
 
 Cognitoまたは別のOIDC Providerを使う場合だけ、`.env.example`をコピーして接続情報を設定します。

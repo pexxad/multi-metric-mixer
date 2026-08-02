@@ -12,6 +12,7 @@ const baseProps = {
   messages: [],
   planning: false,
   activeToolCalls: [],
+  activeGenerations: [],
   executing: false,
   prompt: '',
   onPromptChange: vi.fn(),
@@ -154,6 +155,36 @@ describe('ChatWorkspace', () => {
     expect(timeline.textContent).toContain('24msで完了')
     expect(timeline.textContent).toContain('顧客データのサンプルを取得')
     expect(timeline.textContent).toContain('実行中')
+  })
+
+  it('shows live generated-token estimates separately from MCP activity', () => {
+    render(<ChatWorkspace {...baseProps} planning activeGenerations={[
+      { kind: 'generation', id: 'generation-1', status: 'running', generatedTokens: 128, tokenCount: 'estimated',
+        contentCharacters: 96, reasoningCharacters: 288, elapsedMs: 1_240 },
+    ]} />)
+
+    const timeline = screen.getByRole('region', { name: 'モデル生成状況' })
+    expect(timeline.textContent).toContain('約128 tokens')
+    expect(timeline.textContent).toContain('本文 96文字')
+    expect(timeline.textContent).toContain('推論 288文字')
+    expect(timeline.textContent).toContain('生成中')
+  })
+
+  it('keeps sanitized provider diagnostics behind an error detail toggle', async () => {
+    render(<ChatWorkspace {...baseProps} messages={[{ id: 'error', role: 'system', text: '応答を処理できませんでした。',
+      diagnostic: { code: 'agent_invalid_response', requestId: 'request-1', details: {
+        providerResponse: { finishReason: 'stop', contentPreview: 'not-json', reasoningCharacters: 42 },
+      } },
+    }]} />)
+
+    const toggle = screen.getByText('エラー詳細を表示')
+    const details = toggle.closest('details')!
+    expect(details.hasAttribute('open')).toBe(false)
+    await userEvent.click(toggle)
+    expect(details.hasAttribute('open')).toBe(true)
+    expect(details.textContent).toContain('agent_invalid_response')
+    expect(details.textContent).toContain('not-json')
+    expect(details.textContent).toContain('hidden reasoning本文と認証情報は表示されません')
   })
 
   it('runs the current workflow explicitly and summarizes the latest result', async () => {

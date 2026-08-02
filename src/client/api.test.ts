@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { loadInitialAuth, respondToAgent, type AuthSession } from './api'
+import { ApiProblemError, loadInitialAuth, respondToAgent, type AuthSession } from './api'
 import { sampleWorkflow } from '../shared/workflow'
 
 const session: AuthSession = {
@@ -43,6 +43,9 @@ describe('initial authentication request', () => {
     }
     const body = [
       'event: activity\r\n',
+      `data: ${JSON.stringify({ kind: 'generation', id: 'generation-1', status: 'running', generatedTokens: 16,
+        tokenCount: 'estimated', contentCharacters: 24, reasoningCharacters: 24, elapsedMs: 120 })}\r\n\r\n`,
+      'event: activity\r\n',
       `data: ${JSON.stringify({ ...completed, status: 'running', durationMs: undefined })}\r\n\r\n`,
       'event: activity\r\n',
       `data: ${JSON.stringify(completed)}\r\n\r\n`,
@@ -53,18 +56,37 @@ describe('initial authentication request', () => {
       status: 200,
       headers: { 'Content-Type': 'text/event-stream' },
     })))
-    const activities: Array<typeof completed | Omit<typeof completed, 'durationMs'>> = []
+    const activities: Array<Record<string, unknown>> = []
 
     const response = await respondToAgent(session, {
       clientMessageId: 'message-1',
       message: '売上を調べて',
       workflow: sampleWorkflow,
-    }, (activity) => activities.push(activity as typeof completed))
+    }, (activity) => activities.push(activity))
 
     expect(activities).toMatchObject([
+      { kind: 'generation', id: 'generation-1', status: 'running', generatedTokens: 16 },
       { id: 'call-1', status: 'running' },
       { id: 'call-1', status: 'completed', durationMs: 18 },
     ])
     expect(response).toEqual(finalResponse)
+  })
+
+  it('preserves structured streamed error diagnostics for the UI toggle', async () => {
+    const problem = { title: '応答を処理できませんでした。', detail: '応答を処理できませんでした。',
+      code: 'agent_invalid_response', requestId: 'request-1', errors: {
+        providerResponse: { finishReason: 'stop', contentPreview: 'not-json', reasoningCharacters: 42 },
+      } }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response([
+      'event: error\n', `data: ${JSON.stringify(problem)}\n\n`,
+    ].join(''), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })))
+
+    let caught: unknown
+    try {
+      await respondToAgent(session, { clientMessageId: 'message-1', message: '売上を調べて', workflow: sampleWorkflow }, () => undefined)
+    } catch (error) { caught = error }
+
+    expect(caught).toBeInstanceOf(ApiProblemError)
+    expect(caught).toMatchObject({ problem })
   })
 })

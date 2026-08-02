@@ -26,6 +26,20 @@ export type AgentToolActivity = {
   durationMs?: number
 }
 
+export type AgentGenerationActivity = {
+  kind: 'generation'
+  id: string
+  status: 'running' | 'completed'
+  generatedTokens: number
+  tokenCount: 'estimated' | 'reported'
+  contentCharacters: number
+  reasoningCharacters: number
+  elapsedMs: number
+  finishReason?: string | null
+}
+
+export type AgentStreamActivity = AgentToolActivity | AgentGenerationActivity
+
 type AgentResponseBase = {
   message: string
   changes: string[]

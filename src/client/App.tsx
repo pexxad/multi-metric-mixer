@@ -45,6 +45,7 @@ import {
 } from '../shared/workflow'
 import {
   archiveWorkflow,
+  ApiProblemError,
   executeWorkflow,
   loadInitialAuth,
   loadBootstrap,
@@ -65,7 +66,7 @@ import {
 import type { CatalogVersion } from '../shared/catalog'
 import { LoginView } from './LoginView'
 import { ConnectionManager } from './ConnectionManager'
-import type { AgentResponse, AgentToolActivity } from '../shared/api'
+import type { AgentGenerationActivity, AgentResponse, AgentToolActivity } from '../shared/api'
 import { WorkflowTransferActions } from './WorkflowTransferActions'
 import { OperationsPanel } from './OperationsPanel'
 import { ArtifactDownloadButton } from './ArtifactDownloadButton'
@@ -128,6 +129,7 @@ export function App() {
   const [workflowManagerOpen, setWorkflowManagerOpen] = useState(false)
   const [messages, setMessages] = useState<ChatViewMessage[]>([])
   const [activeToolCalls, setActiveToolCalls] = useState<AgentToolActivity[]>([])
+  const [activeGenerations, setActiveGenerations] = useState<AgentGenerationActivity[]>([])
   const [conversationId, setConversationId] = useState<string>()
   const [proposal, setProposal] = useState<Extract<AgentResponse, { state: 'proposal' }>>()
   const [runApproval, setRunApproval] = useState<{ id: string; expiresAt: string; summary: Record<string, unknown>; saved: SavedWorkflow }>()
@@ -293,12 +295,19 @@ export function App() {
     setPlanning(true)
     setProposal(undefined)
     setActiveToolCalls([])
+    setActiveGenerations([])
     const toolCalls = new Map<string, AgentToolActivity>()
+    const generations = new Map<string, AgentGenerationActivity>()
     const clientMessageId = crypto.randomUUID()
     setMessages((items) => [...items, { id: `local-user-${clientMessageId}`, role: 'user', text: trimmed }])
     try {
       if (!auth) throw new Error('ログインが必要です。')
       const result = await respondToAgent(auth, { message: trimmed, workflow, conversationId, clientMessageId }, (activity) => {
+        if ('generatedTokens' in activity) {
+          generations.set(activity.id, activity)
+          setActiveGenerations([...generations.values()])
+          return
+        }
         toolCalls.set(activity.id, activity)
         setActiveToolCalls([...toolCalls.values()])
       })
@@ -311,6 +320,7 @@ export function App() {
         text: result.message,
         metadata,
         toolCalls: result.toolCalls,
+        generations: [...generations.values()],
       }])
       if (result.state === 'proposal') setProposal(result)
       setConversations((items) => [{ id: nextConversationId, title: items.find((item) => item.id === nextConversationId)?.title ?? trimmed.slice(0, 80),
@@ -322,10 +332,17 @@ export function App() {
         role: 'system',
         text: error instanceof Error ? error.message : String(error),
         toolCalls: [...toolCalls.values()],
+        generations: [...generations.values()],
+        diagnostic: error instanceof ApiProblemError ? {
+          code: error.problem.code,
+          requestId: error.problem.requestId,
+          details: error.problem.errors,
+        } : undefined,
       }])
     } finally {
       setPlanning(false)
       setActiveToolCalls([])
+      setActiveGenerations([])
     }
   }
 
@@ -619,7 +636,8 @@ export function App() {
 
       {chatOpen && <ChatWorkspace workflow={workflow} dataSources={dataSources}
         conversations={conversations} conversationId={conversationId} messages={messages} proposal={proposal}
-        planning={planning} activeToolCalls={activeToolCalls} executing={executing} prompt={prompt} onPromptChange={setPrompt} onSend={(message) => void sendPrompt(message)}
+        planning={planning} activeToolCalls={activeToolCalls} activeGenerations={activeGenerations}
+        executing={executing} prompt={prompt} onPromptChange={setPrompt} onSend={(message) => void sendPrompt(message)}
         onNewConversation={newConversation} onOpenConversation={(id) => void openConversation(id)} onOpenWorkflow={openWorkflowView}
         onRunWorkflow={() => void execute()}
         onApplyProposal={() => void applyProposal()} onApplyProposalAndRun={() => void applyProposal(true)}
